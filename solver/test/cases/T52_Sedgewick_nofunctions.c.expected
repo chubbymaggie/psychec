@@ -1,1 +1,9 @@
-typedef  struct __link__ {int N;struct __link__ * r;struct __link__ * l;}* link ;
+/* Forward declarations */
+typedef  struct TYPE_6__   TYPE_1__ ;
+
+/* Type definitions */
+typedef  TYPE_1__* link ;
+struct TYPE_6__ {int N; struct TYPE_6__* r; struct TYPE_6__* l; } ;
+
+/* Variables and functions */
+

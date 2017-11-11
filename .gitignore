@@ -1,14 +1,10 @@
 *~
-*.vo
-*.v.d
 *.glob
-*kate-swp
 *.aux
 *.bbl
 *.bc
 *.blg
-*.chi
-*.chs.h
+*.dylib
 *.dyn_o
 *.dyn_hi
 *.dot
@@ -23,6 +19,8 @@
 *.status
 *.swp
 *.thm
+*.cstr
+.DS_Store
 
 # Qt Creator project files
 *.creator
@@ -31,12 +29,19 @@
 *.files
 *.includes
 
-.DS_Store
+# CMake stuff
+*CMakeCache.txt
+*CMakeFiles
+*cmake_install.cmake
+*Makefile
 
 # The test file! ;-)
 test.c
 test.c.ctr
+test.c.cstr
 test.c.gen.h
+test_fixed.c
+test_gen.h
 
 solver/dist
 solver/cabal-dev
@@ -46,5 +51,8 @@ solver/.cabal-sandbox/
 solver/.stack-work/
 solver/cabal.sandbox.config
 solver/test/cases/*.ctr
+solver/test/cases/*.cstr
 solver/test/cases/*.fixed.c
 solver/test/cases/*.gen.h
+solver/test/cases/*_fixed.c
+solver/test/cases/*_gen.h

@@ -1,2 +1,10 @@
-typedef int /*<<< orphan or scalar*/ T ;
-typedef struct __A__ {int /*<<< orphan or scalar*/ b;} A ;
+/* Forward declarations */
+typedef  struct TYPE_2__   TYPE_1__ ;
+
+/* Type definitions */
+struct TYPE_2__ {int /*<<< orphan*/  b; } ;
+typedef  int /*<<< orphan*/  T ;
+typedef  TYPE_1__ A ;
+
+/* Variables and functions */
+

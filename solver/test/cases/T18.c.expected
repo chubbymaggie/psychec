@@ -1,2 +1,8 @@
-typedef void* T;
+/* Forward declarations */
+
+/* Type definitions */
+typedef  int /*<<< orphan*/  T ;
+
+/* Variables and functions */
+ int /*<<< orphan*/  malloc (int) ; 
 

@@ -41,9 +41,9 @@ Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
 Definition of solver's state
 ============================
 
-> type SolverM a = ExceptT String (StateT Int IO) a
+> type SolverM a = ExceptT String (StateT (Int, Int) IO) a
 
-> runSolverM :: SolverM a -> Int -> IO (Either String a)
+> runSolverM :: SolverM a -> (Int, Int) -> IO (Either String a)
 > runSolverM s v = do
 >                    (e, n) <- runStateT (runExceptT s) v
 >                    return e
@@ -57,17 +57,17 @@ Context definitions
 > instance Pretty TyCtx where
 >    pprint = printer "is" . Map.map fst . tyctx
 
-> newtype VarCtx = VarCtx { varctx :: Map Name VarInfo }
+> newtype VarCtx = VarCtx { varctx :: Map Name ValSym }
 >                  deriving Eq
 
 > instance Pretty VarCtx where
->    pprint = printer "::" . Map.map varty . varctx
+>    pprint = printer "::" . Map.map valty . varctx
 
 
 Context-related functions
 -------------------------
 
-> undefVars :: Map k VarInfo -> Map k VarInfo
+> undefVars :: Map k ValSym -> Map k ValSym
 > undefVars = Map.filter (not . declared)
 
 > undefTys :: Map k (a, Bool) -> Map k (a, Bool)
@@ -77,7 +77,7 @@ Context-related functions
 Substitution definition
 -----------------------
 
-> newtype Subst = Subst { subs :: Map Name Ty }
+> newtype Subst = Subst { subs :: Map Name Ty } deriving Eq
 
 > nullSubst :: Subst
 > nullSubst = Subst Map.empty
@@ -93,15 +93,32 @@ Fresh variable generation
 
 > fresh :: SolverM Ty
 > fresh = do
->           n <- get
->           put (n + 1)
->           return (TyVar (Name ("#alpha" ++ show n)))
+>           (n, n') <- get
+>           put ((n + 1), n')
+>           return (VarTy (Name ("#alpha" ++ show n)))
+
+> varId :: String -> Int
+> varId = (read . (drop 6))
+
 
 Auxiliar code
 -------------
 
 > printer :: String -> Map Name Ty -> Doc
-> printer sep = hcat . punctuate comma . map (uncurry step) . Map.toList
+> printer sep = hcat . punctuate (text "    ") . map (uncurry step) . Map.toList
 >               where
 >                  step n t = pprint n <+> text sep <+> pprint t
 
+> printer2 :: String -> Map Ty Name -> Doc
+> printer2 sep = hcat . punctuate (text "    ") . map (uncurry step) . Map.toList
+>               where
+>                  step t n = pprint t <+> text sep <+> pprint n
+
+
+Artificial types names
+
+> fakeName :: SolverM Name
+> fakeName = do
+>     (n, n') <- get
+>     put (n, (n' + 1))
+>     return $ Name $ "TYPE_" ++ (show n') ++ "__"

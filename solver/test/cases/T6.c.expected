@@ -1,3 +1,10 @@
-typedef int D ;
-typedef struct __C__ {int /*<<< orphan or scalar*/ y; int /*<<< orphan or scalar*/ x;} C ;
-typedef int A ;
+/* Forward declarations */
+typedef  struct TYPE_3__   TYPE_1__ ;
+
+/* Type definitions */
+struct TYPE_3__ {int x; int y; } ;
+typedef  int D ;
+typedef  TYPE_1__ C ;
+typedef  int A ;
+
+/* Variables and functions */

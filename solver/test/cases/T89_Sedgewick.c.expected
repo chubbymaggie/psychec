@@ -1,2 +1,10 @@
-typedef  struct __Graph__ {int V;}* Graph ;
-int GRAPHdeg (struct __Graph__ *,int) ;
+/* Forward declarations */
+typedef  struct TYPE_4__   TYPE_1__ ;
+
+/* Type definitions */
+struct TYPE_4__ {int V; } ;
+typedef  TYPE_1__* Graph ;
+
+/* Variables and functions */
+ int GRAPHdeg (TYPE_1__*,int) ; 
+

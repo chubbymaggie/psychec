@@ -1,2 +1,8 @@
-int c;
-double d;
+/* Forward declarations */
+
+/* Type definitions */
+
+/* Variables and functions */
+ int c ; 
+ double d ; 
+

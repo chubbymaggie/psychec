@@ -1,30 +1,30 @@
 /******************************************************************************
- * Copyright (c) 2016 Leandro T. C. Melo (ltcmelo@gmail.com)
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
- * USA
+ Copyright (c) 2016,17 Leandro T. C. Melo (ltcmelo@gmail.com)
+
+ This library is free software; you can redistribute it and/or modify it under
+ the terms of the GNU Lesser General Public License as published by the Free
+ Software Foundation; either version 2.1 of the License, or (at your option)
+ any later version.
+
+ This library is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+ for more details.
+
+ You should have received a copy of the GNU Lesser General Public License along
+ with this library; if not, write to the Free Software Foundation, Inc., 51
+ Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
  *****************************************************************************/
 
-#ifndef PSYCHE_CONSTRAINTGENERATOR_H__
-#define PSYCHE_CONSTRAINTGENERATOR_H__
+#ifndef PSYCHE_CONSTRAINT_GENERATOR_H__
+#define PSYCHE_CONSTRAINT_GENERATOR_H__
 
 #include "ASTVisitor.h"
 #include "FreshVarSupply.h"
 #include "FullySpecifiedType.h"
-#include "ScalarTypeLattice.h"
-#include "TypeNameSpeller.h"
+#include "ConstraintSyntax.h"
+#include "DomainLattice.h"
+#include "TypeSpeller.h"
 #include <stack>
 #include <string>
 #include <unordered_map>
@@ -32,23 +32,40 @@
 
 namespace psyche {
 
-class ConstraintStreamWriter;
+class ConstraintWriter;
+class DeclarationInterceptor;
+class VisitorObserver;
 
 /*!
  * \brief The ConstraintGenerator class
  *
  * Responsible for generating the constraints.
  */
-class ConstraintGenerator final : public CPlusPlus::ASTVisitor
+class ConstraintGenerator final : public psyche::ASTVisitor
 {
 public:
-    ConstraintGenerator(CPlusPlus::TranslationUnit *unit,
-                        ConstraintStreamWriter* writer);
+    ConstraintGenerator(psyche::TranslationUnit *unit, ConstraintWriter* writer);
 
-    void generate(CPlusPlus::TranslationUnitAST *ast,
-                  CPlusPlus::Scope *global);
+    void generate(psyche::TranslationUnitAST *ast, psyche::Scope *global);
 
-    void addPrintfVariety(const std::string& funcName, size_t varArgPos);
+    void employDomainLattice(const DomainLattice* lattice);
+
+    void installObserver(VisitorObserver* observer);
+
+    void installInterceptor(DeclarationInterceptor* interceptor);
+
+    /*!
+     * \brief addPrintfLike
+     * \param funcName
+     * \param varArgPos
+     *
+     * Add a printf-like function, one that accepts a format-specifier argument that can be used
+     * to type other arguments.
+     *
+     * Variadic functions in general don't need to be added through this method, they are detected
+     * automatically by our unificaiton algorithm.
+     */
+    void addPrintfLike(const std::string& funcName, size_t varArgPos);
 
 private:
     /*!
@@ -59,100 +76,86 @@ private:
      * Convenience to switch current scope. Works similar to a stack, the
      * caller is responsible to pop the previous scope and push it back later.
      */
-    CPlusPlus::Scope *switchScope(CPlusPlus::Scope *scope);
+    psyche::Scope *switchScope(psyche::Scope *scope);
 
-    // Top-level visitation entry points.
-    void visitDeclaration(CPlusPlus::DeclarationAST *ast);
-    void visitExpression(CPlusPlus::ExpressionAST* ast);
-    void visitName(CPlusPlus::NameAST* ast);
-    void visitSpecifier(CPlusPlus::SpecifierAST *ast);
-    void visitStatement(CPlusPlus::StatementAST *ast);
+    void visitName(psyche::NameAST* ast);
 
     // Declarations
-    bool visit(CPlusPlus::SimpleDeclarationAST *ast) override;
-    bool visit(CPlusPlus::FunctionDefinitionAST *ast) override;
+    void visitDeclaration(psyche::DeclarationAST *ast);
+    bool visit(psyche::SimpleDeclarationAST *ast) override;
+    bool visit(psyche::FunctionDefinitionAST *ast) override;
 
     // Expressions
-    bool visit(CPlusPlus::ArrayAccessAST* ast) override;
-    bool visit(CPlusPlus::BinaryExpressionAST* ast) override;
-    bool visit(CPlusPlus::CallAST *ast) override;
-    bool visit(CPlusPlus::CastExpressionAST *ast) override;
-    bool visit(CPlusPlus::ConditionalExpressionAST *ast) override;
-    bool visit(CPlusPlus::IdExpressionAST* ast) override;
-    bool visit(CPlusPlus::MemberAccessAST* ast) override;
-    bool visit(CPlusPlus::NumericLiteralAST* ast) override;
-    bool visit(CPlusPlus::BoolLiteralAST* ast) override;
-    bool visit(CPlusPlus::StringLiteralAST* ast) override;
-    bool visit(CPlusPlus::UnaryExpressionAST* ast) override;
-    bool visit(CPlusPlus::SizeofExpressionAST* ast) override;
-    bool visit(CPlusPlus::PointerLiteralAST* ast) override;
-    bool visit(CPlusPlus::BracedInitializerAST *ast) override;
-    bool visit(CPlusPlus::PostIncrDecrAST* ast) override;
+    void visitExpression(psyche::ExpressionAST* ast);
+    bool visit(psyche::ArrayAccessAST* ast) override;
+    bool visit(psyche::BinaryExpressionAST* ast) override;
+    bool visit(psyche::CallAST *ast) override;
+    bool visit(psyche::CastExpressionAST *ast) override;
+    bool visit(psyche::ConditionalExpressionAST *ast) override;
+    bool visit(psyche::IdExpressionAST* ast) override;
+    bool visit(psyche::MemberAccessAST* ast) override;
+    bool visit(psyche::UnaryExpressionAST* ast) override;
+    bool visit(psyche::NumericLiteralAST* ast) override;
+    bool visit(psyche::BoolLiteralAST* ast) override;
+    bool visit(psyche::StringLiteralAST* ast) override;
+    bool visit(psyche::SizeofExpressionAST* ast) override;
+    bool visit(psyche::PointerLiteralAST* ast) override;
+    bool visit(psyche::BracedInitializerAST *ast) override;
+    bool visit(psyche::PostIncrDecrAST* ast) override;
 
     // Specifiers
-    bool visit(CPlusPlus::EnumSpecifierAST *ast) override;
-    bool visit(CPlusPlus::ClassSpecifierAST *ast) override;
+    void visitSpecifier(psyche::SpecifierAST *ast);
+    bool visit(psyche::EnumSpecifierAST *ast) override;
+    bool visit(psyche::ClassSpecifierAST *ast) override;
+    bool visit(psyche::GnuAttributeSpecifierAST *ast) override;
 
     // Statements
-    bool visit(CPlusPlus::CaseStatementAST* ast) override;
-    bool visit(CPlusPlus::CompoundStatementAST *ast) override;
-    bool visit(CPlusPlus::DeclarationStatementAST *ast) override;
-    bool visit(CPlusPlus::DoStatementAST *ast) override;
-    bool visit(CPlusPlus::ForStatementAST *ast) override;
-    bool visit(CPlusPlus::ExpressionStatementAST *ast) override;
-    bool visit(CPlusPlus::IfStatementAST *ast) override;
-    bool visit(CPlusPlus::ReturnStatementAST *ast) override;
-    bool visit(CPlusPlus::SwitchStatementAST *ast) override;
-    bool visit(CPlusPlus::WhileStatementAST *ast) override;
+    void visitStatement(psyche::StatementAST *ast);
+    bool visit(psyche::SwitchStatementAST *ast) override;
+    bool visit(psyche::CaseStatementAST* ast) override;
+    bool visit(psyche::CompoundStatementAST *ast) override;
+    bool visit(psyche::DeclarationStatementAST *ast) override;
+    bool visit(psyche::DoStatementAST *ast) override;
+    bool visit(psyche::WhileStatementAST *ast) override;
+    bool visit(psyche::ForStatementAST *ast) override;
+    bool visit(psyche::IfStatementAST *ast) override;
+    bool visit(psyche::ExpressionStatementAST *ast) override;
+    bool visit(psyche::ReturnStatementAST *ast) override;
 
-    //!@{
-    /*!
-     * The constraints rules requires that statements are `and`ed one to
-     * another. But through the visitor we can't see ahead: either 1) we look
-     * behind if there's been a valid statement or 2) we mark whenever a valid
-     * statement has been visited. The approach originally implemented was
-     * option 1, but it can get tricky. Current implementation is option 2.
-     */
-    void maybeFollowStmt();
-    bool seenStmt_;
-    //!@}
+    // Miscellanea
+    bool visit(psyche::EnumeratorAST *ast) override;
+
+    // Symbol visits.
+    void visitSymbol(psyche::Function* func, psyche::StatementAST* body);
 
     //! Scope we're in and the global scope.
-    CPlusPlus::Scope *scope_;
-    CPlusPlus::Scope *global_;
+    psyche::Scope *scope_;
+    psyche::Scope *global_;
 
     //! Writer we use to generate the constraints.
-    ConstraintStreamWriter *writer_;
+    ConstraintWriter *writer_;
 
     //! Type name speller.
-    TypeNameSpeller typeSpeller_;
+    TypeSpeller<ConstraintSyntax> typeSpeller_;
 
     //! Type variables supply and properties.
     FreshVarSupply supply_;
 
-    //! Pointer x integers lattice.
-    ScalarTypeLattice lattice_;
+    //! Domain lattice for "pre inference".
+    const DomainLattice* lattice_;
 
     //! Inside static initialization.
     bool staticDecl_;
 
     //!@{
     /*!
-     * Pointer x scalar lattice related processing.
+     * Domain lattice analysis.
      */
-    bool preprocess_;
-    void applyTypeLattice(const ScalarTypeLattice::Class &lhsClass,
-                          const ScalarTypeLattice::Class &rhsClass,
-                          const std::string &lhsAlpha,
-                          const std::string &rhsAlpha,
-                          int opTk);
-    ScalarTypeLattice::Class classOfExpr(CPlusPlus::ExpressionAST* ast) const;
+    void employLattice(const DomainLattice::Domain &lhsDom, const DomainLattice::Domain &rhsDom,
+                       const std::string &lhsTy, const std::string &rhsTy,
+                       int op);
+    DomainLattice::Domain domainOf(psyche::ExpressionAST* ast) const;
     //!@}
-
-    /*!
-     * Overall initialization.
-     */
-    void prepareForRun();
 
     //!@{
     /*!
@@ -178,25 +181,14 @@ private:
      */
     int unnamedCount_;
     std::string createUnnamed(const std::string &prefix);
-    static std::string paramPrefix_;
+    static std::string declPrefix_;
     static std::string stubPrefix_;
     //!@}
 
     /*!
-     * There's a little "operational inconvenience" when generating constraints
-     * for a declaration: the program's remaining statements come in the middle,
-     * instead of in the end of the rule. Then we must accumulate all type
-     * equivalences from the declarations and write then down later.
+     * Assign the name to type on top of the stack.
      */
-    using EquivPair = std::pair<std::string, std::string>;
-    std::stack<EquivPair> pendingEquivs_;
-
-    /*!
-     * Convenience function to process a program symbol we're interested on,
-     * whever we need to write a type equivalence for it. This will return
-     * the symbol name as a string.
-     */
-    std::string processSymbol(const std::string& name);
+    void assignTop(const std::string& name);
 
     // Helpers
     void castExpressionHelper(const std::string &inputTy, std::string& resultTy);
@@ -204,13 +196,13 @@ private:
     /*!
      * Convert boolean expressions to int.
      */
-    void convertBoolExpression(CPlusPlus::ExpressionAST *ast);
+    void treatAsBool(psyche::ExpressionAST *ast);
 
     /*!
      * Encapsulates the steps to enter a new expression rule and generate its
      * corresponding constraints.
      */
-    void collectExpression(const std::string& ty, CPlusPlus::ExpressionAST* expr);
+    void collectExpression(const std::string& ty, psyche::ExpressionAST* expr);
 
     /*!
      * \brief ensureTypeIsKnown
@@ -236,11 +228,19 @@ private:
     //!@}
 
     std::stack<std::string> structs_;
+    std::vector<std::string> field_;
 
     /*!
-     * Functions with "printf style" we understand.
+     * Variadic functions in printf-style in which a format-specifier is used to type
+     * arguments.
      */
     std::unordered_map<std::string, size_t> printfs_;
+
+    //! Generation's observer.
+    VisitorObserver* observer_;
+
+    //! Generation's interceptor.
+    DeclarationInterceptor* interceptor_;
 };
 
 } // namespace psyche

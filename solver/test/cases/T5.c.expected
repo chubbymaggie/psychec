@@ -1,3 +1,9 @@
-typedef int /*<<< orphan or scalar*/ C ;
-typedef int /*<<< orphan or scalar*/ B ;
-typedef int A ;
+/* Forward declarations */
+
+/* Type definitions */
+typedef  int /*<<< orphan*/  C ;
+typedef  int /*<<< orphan*/  B ;
+typedef  int A ;
+
+/* Variables and functions */
+

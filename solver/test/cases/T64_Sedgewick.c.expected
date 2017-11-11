@@ -1,2 +1,15 @@
-typedef  struct __point__ {float x;float y;} point ;
-float distance (struct __point__ ,struct __point__ ) ;
+/* Forward declarations */
+typedef  struct TYPE_5__   TYPE_1__ ;
+
+/* Type definitions */
+struct TYPE_5__ {float x; float y; } ;
+typedef  TYPE_1__ point ;
+
+/* Variables and functions */
+ double RAND_MAX ;
+ float atof (char*) ;
+ int atoi (char*) ;
+ float distance (TYPE_1__,TYPE_1__) ;
+ TYPE_1__* malloc (int) ;
+ int /*<<< orphan*/  printf (char*,int,float) ;
+ double rand () ;

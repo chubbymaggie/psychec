@@ -26,26 +26,27 @@ import Data.BuiltIn
 
 convertible :: Ty -> Ty -> Bool
 convertible t t' =
-    or [ t == t'
-       -- Arithmetic types convert among themselves.
-       , and [isArithTy t, isArithTy t']
+  or [
+      monoConvertible t t',
+      or [t == PtrTy void, t' == PtrTy void],
+      or [t == PtrTy (QualTy void Const), t' == PtrTy (QualTy void Const)]
+     ]
 
-       -- Enumerators are fundamentally integers.
-       , and [isArithTy t, isEnum t']
-       , and [isEnum t, isArithTy t']
-
-       -- We consider void* a top-type.
-       , or [t == Pointer void, t' == Pointer void]
-       , or [t == Pointer (QualTy void), t' == Pointer (QualTy void)]
-
-       -- Attention: The scalar-type lattice prevents overunification issues
-       -- by dropping inconsistent constraints between pointers and arithmetic
-       -- types. But it's not yet working inter-procedurally by matching
-       -- formals x arguments. We'll eventually remove the conversions below.
-       -- Even though we found real programs relying on it.
-       , and [isArithTy t, isPointer t']
-       , and [isPointer t, isArithTy t']
-       ]
+monoConvertible :: Ty -> Ty -> Bool
+monoConvertible t t' =
+  or [
+      t == t',
+      and [isArithTy t, isArithTy t'],
+      and [isArithTy t, isEnum t'],
+      and [isEnum t, isArithTy t'],
+      and [isArithTy t, t' == scalar_t__],
+      and [t == scalar_t__, isArithTy t'],
+      and [isPtrTy t, t' == scalar_t__],
+      and [t == scalar_t__, isPtrTy t'],
+      -- Due to function pointer decaying.
+      and [isFunTy t, t' == scalar_t__],
+      and [t == scalar_t__, isFunTy t']
+     ]
 
 isEnum :: Ty -> Bool
 isEnum (EnumTy _) = True

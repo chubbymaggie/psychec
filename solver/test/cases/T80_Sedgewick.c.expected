@@ -1,4 +1,13 @@
-typedef  struct __link__ {int sz;struct __link__ ** next;int /*<<< orphan or scalar*/ item;}* link ;
-typedef  int /*<<< orphan or scalar*/ Item ;
-int /*<<< orphan or scalar*/ NULLitem ;
-int lgNmax ;
+/* Forward declarations */
+typedef  struct TYPE_5__   TYPE_1__ ;
+
+/* Type definitions */
+typedef  TYPE_1__* link ;
+struct TYPE_5__ {int sz; struct TYPE_5__** next; int /*<<< orphan*/  item; } ;
+typedef  int /*<<< orphan*/  Item ;
+
+/* Variables and functions */
+ int /*<<< orphan*/  NULLitem ; 
+ int lgNmax ; 
+ void* malloc (int) ; 
+

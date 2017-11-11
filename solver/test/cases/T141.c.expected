@@ -1,2 +1,8 @@
-typedef  int /*<<< orphan or scalar*/ (* FT ) () ;
-int /*<<< orphan or scalar*/ f () ;
+/* Forward declarations */
+
+/* Type definitions */
+typedef  int /*<<< orphan*/  (* FT ) () ;
+
+/* Variables and functions */
+ int /*<<< orphan*/  f () ; 
+

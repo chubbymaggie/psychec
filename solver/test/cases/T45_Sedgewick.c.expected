@@ -1,3 +1,12 @@
-typedef  struct __link__ {int item;struct __link__ * next;}* link ;
-struct __link__ * deleteNext (struct __link__ *) ;
-void insertNext (struct __link__ *,struct __link__ *) ;
+/* Forward declarations */
+typedef  struct TYPE_13__   TYPE_1__ ;
+
+/* Type definitions */
+typedef  TYPE_1__* link ;
+struct TYPE_13__ {int item; struct TYPE_13__* next; } ;
+
+/* Variables and functions */
+ TYPE_1__* deleteNext (TYPE_1__*) ; 
+ void insertNext (TYPE_1__*,TYPE_1__*) ; 
+ TYPE_1__* malloc (int ) ;
+

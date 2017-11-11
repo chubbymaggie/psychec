@@ -1,15 +1,21 @@
-typedef  int /*<<< orphan or scalar*/ (* T4 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* T3 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* T2 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* T1 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* S4 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* S3 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* S2 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* S1 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* Q4 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* Q3 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* Q2 ) () ;
-typedef  int /*<<< orphan or scalar*/ (* Q1 ) () ;
-int /*<<< orphan or scalar*/ f () ;
-int /*<<< orphan or scalar*/ g () ;
-int /*<<< orphan or scalar*/ h () ;
+/* Forward declarations */
+
+/* Type definitions */
+typedef  int /*<<< orphan*/  (* T4 ) () ;
+typedef  int /*<<< orphan*/  (* T3 ) () ;
+typedef  int /*<<< orphan*/  (* T2 ) () ;
+typedef  int /*<<< orphan*/  (* T1 ) () ;
+typedef  int /*<<< orphan*/  (* S4 ) () ;
+typedef  int /*<<< orphan*/  (* S3 ) () ;
+typedef  int /*<<< orphan*/  (* S2 ) () ;
+typedef  int /*<<< orphan*/  (* S1 ) () ;
+typedef  int /*<<< orphan*/  (* Q4 ) () ;
+typedef  int /*<<< orphan*/  (* Q3 ) () ;
+typedef  int /*<<< orphan*/  (* Q2 ) () ;
+typedef  int /*<<< orphan*/  (* Q1 ) () ;
+
+/* Variables and functions */
+ int /*<<< orphan*/  f () ; 
+ int /*<<< orphan*/  g () ; 
+ int /*<<< orphan*/  h () ; 
+

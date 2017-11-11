@@ -1,20 +1,19 @@
 /******************************************************************************
- * Copyright (c) 2016 Leandro T. C. Melo (ltcmelo@gmail.com)
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301
- * USA
+ Copyright (c) 2016,17 Leandro T. C. Melo (ltcmelo@gmail.com)
+
+ This library is free software; you can redistribute it and/or modify it under
+ the terms of the GNU Lesser General Public License as published by the Free
+ Software Foundation; either version 2.1 of the License, or (at your option)
+ any later version.
+
+ This library is distributed in the hope that it will be useful, but WITHOUT
+ ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+ for more details.
+
+ You should have received a copy of the GNU Lesser General Public License along
+ with this library; if not, write to the Free Software Foundation, Inc., 51
+ Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
  *****************************************************************************/
 
 /*
@@ -23,12 +22,13 @@
 */
 
 #include "ConstraintGenerator.h"
-#include "ConstraintStreamWriter.h"
+#include "ConstraintWriter.h"
 #include "AST.h"
 #include "Assert.h"
 #include "BuiltinNames.h"
 #include "Control.h"
 #include "CoreTypes.h"
+#include "DeclarationInterceptor.h"
 #include "Debug.h"
 #include "Literals.h"
 #include "PrintfScanner.h"
@@ -36,12 +36,14 @@
 #include "Symbols.h"
 #include "SymbolPP.h"
 #include "TranslationUnit.h"
-#include "TypeOfExpr.h"
-#include "Utils.h"
+#include "TypeOfExpression.h"
+#include "VisitorObserver.h"
 #include <iostream>
 #include <algorithm>
 
 #define VISITOR_NAME "ConstraintGenerator"
+
+#define OBSERVE(AST_NAME) ObserverInvoker<AST_NAME> invoker(observer_, ast, scope_)
 
 #define ENSURE_NONEMPTY_TYPE_STACK(CODE) \
     PSYCHE_ASSERT(!types_.empty(), CODE, "type stack must be nonempty")
@@ -49,14 +51,7 @@
 #define ENSURE_NONEMPTY_ALPHA_RET_STACK(CODE) \
     PSYCHE_ASSERT(!valuedRets_.empty(), CODE, "alpha return stack must be nonempty")
 
-#define CLASSIFY(ast) \
-    do { \
-        if (preprocess_) { \
-            lattice_.totalize(ast, scope_); \
-        } \
-    } while (false) \
-
-using namespace CPlusPlus;
+using namespace psyche;
 using namespace psyche;
 
 namespace {
@@ -65,57 +60,45 @@ namespace {
 // the underlying name is indeed a simple one.
 std::string extractId(const Name* name)
 {
-    PSYCHE_ASSERT(name && name->isNameId(),
+    PSYCHE_ASSERT(name && (name->isNameId() || name->isTaggedNameId()),
                   return std::string(),
-                  "expected simple name");
+                  "expected either trival or elaborated name");
 
-    const Identifier *id = name->asNameId()->identifier();
+    const Identifier *id = name->identifier();
     return std::string(id->chars(), id->size());
 }
 
 }
 
-std::string ConstraintGenerator::paramPrefix_ = "param";
+std::string ConstraintGenerator::declPrefix_ = "decl";
 std::string ConstraintGenerator::stubPrefix_ = "stub";
 
 ConstraintGenerator::ConstraintGenerator(TranslationUnit *unit,
-                                         ConstraintStreamWriter* writer)
+                                         ConstraintWriter* writer)
     : ASTVisitor(unit)
-    , seenStmt_(false)
     , scope_(nullptr)
     , writer_(writer)
-    , typeSpeller_(writer)
-    , lattice_(unit)
+    , lattice_(nullptr)
     , staticDecl_(false)
-    , preprocess_(true)
     , unnamedCount_(0)
+    , observer_(nullptr)
+    , interceptor_(nullptr)
 {
-    addPrintfVariety("printf", 0);
-    addPrintfVariety("printf_s", 0);
-    addPrintfVariety("wprintf", 0);
-    addPrintfVariety("wprintf_s", 0);
-    addPrintfVariety("fprintf", 1);
-    addPrintfVariety("fprintf_s", 1);
-    addPrintfVariety("fwprintf", 1);
-    addPrintfVariety("fwprintf_s", 1);
-    addPrintfVariety("sprintf", 1);
-    addPrintfVariety("snprintf", 2);
-    addPrintfVariety("snprintf_s", 2);
-    addPrintfVariety("sprintf_s", 2);
-    addPrintfVariety("swprintf", 2);
-    addPrintfVariety("swprintf_s", 2);
-    addPrintfVariety("snwprintf_s", 2);
-}
-
-void ConstraintGenerator::prepareForRun()
-{
-    staticDecl_ = false;
-    preprocess_ = false;
-    supply_.resetCounter();
-    unnamedCount_ = 0;
-    knownFuncNames_.clear();
-    knownFuncRets_.clear();
-    printDebug("Let's generate constraints!!!\n");
+    addPrintfLike("printf", 0);
+    addPrintfLike("printf_s", 0);
+    addPrintfLike("wprintf", 0);
+    addPrintfLike("wprintf_s", 0);
+    addPrintfLike("fprintf", 1);
+    addPrintfLike("fprintf_s", 1);
+    addPrintfLike("fwprintf", 1);
+    addPrintfLike("fwprintf_s", 1);
+    addPrintfLike("sprintf", 1);
+    addPrintfLike("snprintf", 2);
+    addPrintfLike("snprintf_s", 2);
+    addPrintfLike("sprintf_s", 2);
+    addPrintfLike("swprintf", 2);
+    addPrintfLike("swprintf_s", 2);
+    addPrintfLike("snwprintf_s", 2);
 }
 
 void ConstraintGenerator::generate(TranslationUnitAST *ast, Scope *global)
@@ -125,34 +108,30 @@ void ConstraintGenerator::generate(TranslationUnitAST *ast, Scope *global)
 
     global_ = global;
 
-    // Build the expression lattice.
-    bool prevState = writer_->blockWriting(true);
-    Scope *previousScope = switchScope(global);
+    printDebug("Let's generate constraints!!!\n");
+    OBSERVE(TranslationUnitAST);
+    switchScope(global_);
     for (DeclarationListAST *it = ast->declaration_list; it; it = it->next)
         visitDeclaration(it->value);
-    switchScope(previousScope);
-    writer_->blockWriting(prevState);
-
-    prepareForRun();
-
-    // Constraint processing.
-    previousScope = switchScope(global);
-    for (DeclarationListAST *it = ast->declaration_list; it; it = it->next) {
-        visitDeclaration(it->value);
-        if(it->next && ((it->value->asFunctionDefinition() &&
-                        it->value->asFunctionDefinition()->function_body->asCompoundStatement()) ||
-                        (it->value->asSimpleDeclaration() &&
-                         it->value->asSimpleDeclaration()->symbols &&
-                         it->value->asSimpleDeclaration()->symbols->value->storage() == Symbol::Typedef)
-                       )) {
-            writer_->clearIndent();
-            writer_->writeAnd(true);
-        }
-    }
-    switchScope(previousScope);
 }
 
-void ConstraintGenerator::addPrintfVariety(const std::string &funcName, size_t varArgPos)
+void ConstraintGenerator::employDomainLattice(const DomainLattice* lattice)
+{
+    lattice_ = lattice;
+}
+
+void ConstraintGenerator::installObserver(VisitorObserver *observer)
+{
+    observer_ = observer;
+    //observer_->configure(translationUnit(), writer_);
+}
+
+void ConstraintGenerator::installInterceptor(DeclarationInterceptor *interceptor)
+{
+    interceptor_ = interceptor;
+}
+
+void ConstraintGenerator::addPrintfLike(const std::string &funcName, size_t varArgPos)
 {
     printfs_.insert(std::make_pair(funcName, varArgPos));
 }
@@ -183,14 +162,14 @@ std::string ConstraintGenerator::createUnnamed(const std::string& prefix)
     return prefix + std::to_string(count);
 }
 
-std::string ConstraintGenerator::processSymbol(const std::string& name)
+void ConstraintGenerator::assignTop(const std::string& name)
 {
+    writer_->beginSection();
     writer_->writeTypeof(name);
-    writer_->writeTypeEquiv();
-    ENSURE_NONEMPTY_TYPE_STACK(return std::string());
-    writer_->writeTypeName(types_.top());
-
-    return name;
+    writer_->writeEquivMark();
+    ENSURE_NONEMPTY_TYPE_STACK(return);
+    writer_->writeTypeSection(types_.top());
+    writer_->endSection();
 }
 
 void ConstraintGenerator::collectExpression(const std::string &ty,
@@ -211,103 +190,108 @@ void ConstraintGenerator::visitDeclaration(DeclarationAST *ast)
 
 bool ConstraintGenerator::visit(FunctionDefinitionAST *ast)
 {
+    if (interceptor_ && interceptor_->intercept(ast))
+        return false;
+
     DEBUG_VISIT(FunctionDefinitionAST);
+    OBSERVE(FunctionDefinitionAST);
 
     Function* func = ast->symbol;
     if (!func->name()->isNameId())
         return false;
 
-    // Deal with parameters.
-    std::vector<ConstraintStreamWriter::ParamPair> params;
-    if (func->hasArguments()) {
-        for (auto i = 0u; i < func->argumentCount(); i++) {
-            Symbol *arg = func->argumentAt(i);
-            std::string specifier = typeSpeller_.spellTypeName(arg->type(), scope_);
-
-            const Name *argName = arg->name();
-            if(argName) {
-                const Identifier *idArgName = argName->asNameId()->identifier();
-                std::string declarator(idArgName->begin(), idArgName->end());
-                params.emplace_back(specifier, declarator);
-            } else {
-                params.emplace_back(specifier, createUnnamed(paramPrefix_));
-            }
-        }
-
-        // Write their types.
-        std::vector<ConstraintStreamWriter::ParamPair> paramsTypes;
-        std::vector<ConstraintStreamWriter::ParamPair>::const_iterator it;
-        for(it = params.begin(); it != params.end(); ++it) {
-            std::string alpha = supply_.createTypeVar1();
-            paramsTypes.emplace_back(alpha, (*it).first);
-            writer_->writeNewTypeVar(alpha);
-        }
-        for(it = paramsTypes.begin(); it != paramsTypes.end(); ++it) {
-            writer_->writeTypedef((*it).second, (*it).first);
-            writer_->writeAnd(true);
-        }
-    }
-
-    // Write the function prototype. If no return type is specified, we adopt
-    // old-style C rule to assume it as an `int'.
-    std::string funcRet;
-    if (func->returnType()) {
-        funcRet = typeSpeller_.spellTypeName(func->returnType(), scope_);
-    } else {
-        funcRet = kDefaultIntTy;
-    }
-    const std::string& alpha = ensureTypeIsKnown(funcRet);
-    const Identifier *id = func->name()->asNameId()->identifier();
-    const std::string funcName(id->begin(), id->end());
-    writer_->writeFuncDecl(funcName, params, funcRet);
-
-    // Enter the function's body.
-    valuedRets_.push(false);
-    pushType(funcRet);
-    Scope *previousScope = switchScope(func->asScope());
-    visitStatement(ast->function_body);
-    switchScope(previousScope);
-    popType();
-
-    // If no valued return was detected for this function and its return is of
-    // an unknown type, we add an equivalence between it and its alpha.
-    ENSURE_NONEMPTY_ALPHA_RET_STACK(return false);
-    bool hasValue = valuedRets_.top();
-    valuedRets_.pop();
-    if (!hasValue && !alpha.empty())
-        pendingEquivs_.push(EquivPair(alpha, funcRet));
-
-    // Keep track of function return types, since we can use this information
-    // for function calls that are expression statements.
-    knownFuncNames_.insert(std::make_pair(funcName, funcRet));
-    auto it = knownFuncRets_.find(funcName);
-    if (it != knownFuncRets_.end()) {
-        for (const auto& ignored : it->second) {
-            pendingEquivs_.push(EquivPair(ignored, funcRet));
-        }
-    }
-
-    // Time to write any pending equivalences.
-    auto writePending = [this]() {
-        const EquivPair& equiv = pendingEquivs_.top();
-        writer_->writeEquivRelation(equiv.first, equiv.second);
-        pendingEquivs_.pop();
-    };
-    while (!pendingEquivs_.empty()) {
-        maybeFollowStmt();
-        writePending();
-    }
-
-    writer_->clearIndent();
-    writer_->breakLine();
-    seenStmt_ = false;
+    visitSymbol(func, ast->function_body);
 
     return false;
 }
 
+void ConstraintGenerator::visitSymbol(Function *func, StatementAST* body)
+{
+    std::vector<std::string> paramTyVars;
+    for (auto i = 0u; i < func->argumentCount(); i++) {
+        std::string alpha = supply_.createTypeVar1();
+        writer_->writeExists(alpha);
+
+        Symbol *sym = func->argumentAt(i);
+        const std::string& ty = typeSpeller_.spell(sym->type(), scope_);
+        writer_->writeTypedef(ty, alpha);
+        paramTyVars.push_back(ty);
+
+        writer_->writeEquivRel(alpha, ty);
+    }
+
+    // Write the function prototype. When no return type is specified, adopt old-style C
+    // rule and assume `int'.
+    std::string funcRet;
+    if (func->returnType())
+        funcRet = typeSpeller_.spell(func->returnType(), scope_);
+    else
+        funcRet = kDefaultIntTy;
+
+    const std::string& alpha = ensureTypeIsKnown(funcRet);
+    const Identifier *id = func->name()->asNameId()->identifier();
+    const std::string funcName(id->begin(), id->end());
+    writer_->writeFuncDecl(funcName, paramTyVars, funcRet);
+
+    if (func->storage() == Symbol::Static)
+        writer_->writeStatic(funcName);
+
+    // The function name and parameter's type names are visible in the outer scope, but parameter
+    // themselves are visible within the function body only.
+    writer_->openScope();
+    if (observer_)
+        observer_->withinFunction();
+
+    for (auto i = 0u; i < func->argumentCount(); i++) {
+        std::string param;
+        if(func->argumentAt(i)
+                && func->argumentAt(i)->name()) {
+            const Name* paramName = func->argumentAt(i)->name();
+            const Identifier* id = paramName->asNameId()->identifier();
+            param.assign(id->begin(), id->end());
+        } else {
+            param = createUnnamed(declPrefix_);
+        }
+        writer_->writeVarDecl(param, paramTyVars[i]);
+    }
+
+    valuedRets_.push(false);
+    if (body) {
+        pushType(funcRet);
+        Scope *prevScope = switchScope(func->asScope());
+        visitStatement(body);
+        switchScope(prevScope);
+        if (valuedRets_.top())
+            writer_->writeEquivRel(alpha, types_.top());
+        popType();
+    }
+
+    if (observer_)
+        observer_->outsideFunction();
+    writer_->closeScope();
+
+    // If no valued return was detected, this alpha will be orphanized.
+    ENSURE_NONEMPTY_ALPHA_RET_STACK(return);
+    if (! valuedRets_.top())
+        writer_->writeEquivRel(alpha, funcRet);
+    valuedRets_.pop();
+
+    // Keep track of function returns.
+    knownFuncNames_.insert(std::make_pair(funcName, funcRet));
+    auto it = knownFuncRets_.find(funcName);
+    if (it != knownFuncRets_.end()) {
+        for (const auto& ignored : it->second)
+            writer_->writeEquivRel(ignored, funcRet);
+    }
+}
+
 bool ConstraintGenerator::visit(SimpleDeclarationAST *ast)
 {
+    if (interceptor_ && interceptor_->intercept(ast))
+        return false;
+
     DEBUG_VISIT(SimpleDeclarationAST);
+    OBSERVE(SimpleDeclarationAST);
 
     for (SpecifierListAST *it = ast->decl_specifier_list; it; it = it->next)
         visitSpecifier(it->value);
@@ -319,56 +303,56 @@ bool ConstraintGenerator::visit(SimpleDeclarationAST *ast)
     // declarator, and we can uniformily iterate over the two lists.
     DeclaratorListAST *declIt = ast->declarator_list;
     for (const List<Symbol*> *symIt = ast->symbols; symIt; symIt = symIt->next) {
+        if (symIt->value->asForwardClassDeclaration())
+            break;
         PSYCHE_ASSERT(declIt->value, return false, "expected declarator");
 
-        // Current symbol.
         Symbol *decl = symIt->value;
-        const Name *name = decl->name();
-        std::string declName = extractId(name);
 
-        // Just as we do for function definitions, in the case this is a function
-        // declaration but with no return type, we use old-style C rules to
-        // consider it as returning int.
-        if ((decl->asFunction() && !decl->asFunction()->returnType())
-                || (decl->type()->asFunctionType()
-                    && !decl->type()->asFunctionType()->returnType())) {
-            Function* func = decl->asFunction();
-            if (!func)
-                func = decl->type()->asFunctionType();
-            FullySpecifiedType retTy(control()->integerType(IntegerType::Int));
-            func->setReturnType(retTy);
+        // Type a function declaration just as we do for a function definition.
+        if (decl->asDeclaration()
+                && decl->asDeclaration()->type()
+                && decl->asDeclaration()->type()->asFunctionType()) {
+            visitSymbol(decl->asDeclaration()->type()->asFunctionType()->asFunction(), nullptr);
+            return false;
         }
-        std::string declTy = typeSpeller_.spellTypeName(decl->type(), scope_);
+
+        std::string declName;
+        if (decl->name())
+            declName = extractId(decl->name());
+        else
+            declName = createUnnamed(declPrefix_);
+        std::string declTy = typeSpeller_.spell(decl->type(), scope_);
 
         // Altough a `typedef` is parsed as a simple declaration, its contraint
         // rule is different. We process it and break out, since there cannot
         // exist multiple typedefs within one declaration.
         if (decl->storage() == Symbol::Typedef) {
             writer_->writeTypedef(declName, declTy);
-            writer_->breakLine();
             PSYCHE_ASSERT(!symIt->next, return false,
                           "multiple symbols within typedef cannot exist");
             return false;
         }
 
         const std::string& alpha = ensureTypeIsKnown(declTy);
+        writer_->writeEquivRel(alpha, declTy);
 
-        // If an initializer is provided, visit the expression. Unless, it
+        // If an initializer is provided, visit the expression. Unless, if
         // contains braces. If the declaration is of a record, we'll only
         // generate constraints if one of its fields are accessed. If the
         // declaration if of an array, we'll deal with it further down.
         if (declIt->value->initializer
                 && !declIt->value->initializer->asBracedInitializer()) {
             const std::string& rhsAlpha = supply_.createTypeVar1();
-            writer_->writeNewTypeVar(rhsAlpha);
-            pushType(rhsAlpha);
-            visitExpression(declIt->value->initializer);
-            writer_->writeAnd(true);
+            writer_->writeExists(rhsAlpha);
+            collectExpression(rhsAlpha, declIt->value->initializer);
 
-            applyTypeLattice(lattice_.recover(decl), classOfExpr(declIt->value->initializer),
-                             alpha, rhsAlpha, T_EQUAL);
+            const std::string& dummy = supply_.createTypeVar1();
+            writer_->writeExists(dummy);
+            pushType(dummy);
+            employLattice(lattice_->retrieveDomain(decl, scope_), domainOf(declIt->value->initializer),
+                          alpha, rhsAlpha, T_EQUAL);
             popType();
-            writer_->writeAnd(true);
         }
 
         writer_->writeVarDecl(declName, alpha);
@@ -377,8 +361,7 @@ bool ConstraintGenerator::visit(SimpleDeclarationAST *ast)
         // a containment relationship for it.
         if (!structs_.empty()) {
             const std::string& structTy = structs_.top();
-            writer_->writeMemberRelation(structTy, declName, alpha);
-            writer_->writeAnd(true);
+            writer_->writeMemberRel(structTy, declName, alpha);
         }
 
         // When we have an array with an initializer, we use the individual
@@ -400,10 +383,8 @@ bool ConstraintGenerator::visit(SimpleDeclarationAST *ast)
             auto decltr = declIt->value->postfix_declarator_list;
             do {
                 auto size = decltr->value->asArrayDeclarator()->expression;
-                if (size) {
+                if (size)
                     collectExpression(kDefaultIntTy, size);
-                    writer_->writeAnd();
-                }
                 decltr = decltr->next;
             } while (decltr && decltr->value->asArrayDeclarator());
 
@@ -411,7 +392,7 @@ bool ConstraintGenerator::visit(SimpleDeclarationAST *ast)
                     && declIt->value->initializer->asBracedInitializer()
                     && declIt->value->initializer->asBracedInitializer()->expression_list) {
                 std::string elem = supply_.createTypeVar1();
-                writer_->writeNewTypeVar(elem);
+                writer_->writeExists(elem);
 
                 auto init = declIt->value->initializer->asBracedInitializer()->expression_list;
                 if (scope_ == global_ || decl->storage() == Symbol::Static)
@@ -421,30 +402,30 @@ bool ConstraintGenerator::visit(SimpleDeclarationAST *ast)
                     init = init->next;
                     if (!init)
                         break;
-                    writer_->writeAnd();
                 } while (true);
                 staticDecl_ = false; // Just make it false, cannot nest.
 
                 auto decltrs = declIt->value->postfix_declarator_list;
                 do {
-                    writer_->writeAnd();
                     const std::string& ptr = supply_.createTypeVar1();
-                    writer_->writeNewTypeVar(ptr);
-                    writer_->writePointerRelation(ptr, elem);
+                    writer_->writeExists(ptr);
+                    writer_->writePtrRel(ptr, elem);
                     elem = ptr;
                     decltrs = decltrs->next;
                 } while (decltrs && decltrs->value->asArrayDeclarator());
-                writer_->writeAnd();
-                writer_->writeEquivRelation(alpha, elem);
-                writer_->writeAnd(true);
+                writer_->writeEquivRel(alpha, elem);
             }
+        } else if (declIt->value->initializer
+                   && declIt->value->initializer->asBracedInitializer()
+                   && declIt->value->initializer->asBracedInitializer()->expression_list) {
+            // TODO: When this is an array hidden by a missing typedef.
+            pushType(alpha);
+            visitExpression(declIt->value->initializer);
+            ENSURE_NONEMPTY_TYPE_STACK(return false);
+            popType();
         }
 
         declIt = declIt->next;
-
-        // Remember about the pending type equivalence for this declaration,
-        // which we write down only after traversing the remaining statements.
-        pendingEquivs_.push(EquivPair(alpha, declTy));
     }
 
     return false;
@@ -460,9 +441,8 @@ void ConstraintGenerator::visitName(NameAST *ast)
 std::string ConstraintGenerator::ensureTypeIsKnown(std::string& tyName)
 {
     std::string alpha = supply_.createTypeVar1();
-    writer_->writeNewTypeVar(alpha);
+    writer_->writeExists(alpha);
     writer_->writeTypedef(tyName, alpha);
-    writer_->writeAnd(true);
     return alpha;
 }
 
@@ -473,252 +453,226 @@ void ConstraintGenerator::visitExpression(ExpressionAST *ast)
     accept(ast);
 }
 
-namespace {
-
-const std::string nonPolyOprtrName(int opTk)
+void ConstraintGenerator::employLattice(const DomainLattice::Domain& lhsDom,
+                                        const DomainLattice::Domain& rhsDom,
+                                        const std::string& lhsTy,
+                                        const std::string& rhsTy,
+                                        int op)
 {
-    switch (opTk) {
-    case T_STAR:
-        return "*";
+    printDebug("Binary expression  %s x %s\n", lhsDom.name_.c_str(), rhsDom.name_.c_str());
 
-    case T_SLASH:
-        return "/";
+    auto isInconsistent = [&lhsDom, &rhsDom] () {
+        return ((lhsDom == DomainLattice::Pointer
+                    && (rhsDom == DomainLattice::Integral
+                        || rhsDom == DomainLattice::FloatingPoint
+                        || rhsDom == DomainLattice::Arithmetic))
+                || (rhsDom == DomainLattice::Pointer
+                    && (lhsDom == DomainLattice::Integral
+                        || lhsDom == DomainLattice::FloatingPoint
+                        || lhsDom == DomainLattice::Arithmetic)));
+    };
 
-    case T_PERCENT:
-        return "%";
+    switch (op) {
+    case T_MINUS:
+        if (lhsDom == DomainLattice::Pointer && rhsDom == DomainLattice::Pointer) {
+            writer_->writeEquivRel(lhsTy, rhsTy);
+            writer_->writeEquivRel(types_.top(), kDefaultArithTy);
+            break;
+        }
+        // Fallthrough
 
-    case T_AMPER:
-        return "&";
+    case T_PLUS: {
+        auto handlePtr = [this] (const std::string& ptrTy,
+                                 const std::string& otherTy,
+                                 const DomainLattice::Domain& otherDom) {
+            writer_->writeEquivRel(types_.top(), ptrTy);
+            if (otherDom == DomainLattice::Scalar) {
+                writer_->writeEquivRel(otherTy, kIntTy);
+            } else if (otherDom == DomainLattice::Arithmetic
+                        || otherDom == DomainLattice::Integral
+                        || otherDom == DomainLattice::FloatingPoint) {
+                writer_->writeEquivRel(otherTy, otherDom.ty_.empty() ? kIntTy : otherDom.ty_);
+            } else {
+                // TODO: report error.
+            }
+        };
 
-    case T_PIPE:
-        return "|";
+        auto handleArith = [this] (const std::string& arithTy,
+                                   const std::string& otherTy,
+                                   const DomainLattice::Domain& otherDom) {
+            if (otherDom == DomainLattice::Arithmetic
+                    || otherDom == DomainLattice::Integral
+                    || otherDom == DomainLattice::FloatingPoint) {
+                writer_->writeEquivRel(arithTy, otherTy);
+                writer_->writeEquivRel(types_.top(), arithTy); // TODO: Use side with higher rank.
+            } else {
+                PSYCHE_ASSERT(otherDom == DomainLattice::Scalar, return, "expected scalar");
+                writer_->writeEquivRel(types_.top(), otherTy);
+                writer_->writeSubtypeRel(otherTy, kScalarTy);
+            }
+        };
 
-    case T_CARET:
-        return "^";
-
-    case T_LESS_LESS:
-        return "<<";
-
-    case T_GREATER_GREATER:
-        return ">>";
-
-    default:
-        PSYCHE_ASSERT(false, return "", "operator is polymorphic");
-        return "";
+        if (lhsDom == DomainLattice::Pointer) {
+            handlePtr(lhsTy, rhsTy, rhsDom);
+        } else if (rhsDom == DomainLattice::Pointer) {
+            handlePtr(rhsTy, lhsTy, lhsDom);
+        } else if (lhsDom == DomainLattice::Arithmetic
+                || lhsDom == DomainLattice::Integral
+                || lhsDom == DomainLattice::FloatingPoint) {
+            handleArith(lhsTy, rhsTy, rhsDom);
+        } else if (rhsDom == DomainLattice::Arithmetic
+                || rhsDom == DomainLattice::Integral
+                || rhsDom == DomainLattice::FloatingPoint) {
+            handleArith(rhsTy, lhsTy, lhsDom);
+        } else {
+            // Scalars
+            writer_->writeEquivRel(types_.top(), lhsTy);
+            writer_->writeEquivRel(lhsTy, rhsTy);
+            writer_->writeSubtypeRel(lhsTy, kScalarTy);
+            writer_->writeSubtypeRel(rhsTy, kScalarTy);
+        }
+        break;
     }
-}
 
-/*!
- * \brief isPolyOprtr
- * \param opTk
- *
- * Return whether the operator is polymorhpic. But we don't consider polymorphism
- * among numeric types themsleves (i.e. between integers and floating points).
- * We are interested on operators in which pointer types can be operands.
- */
-bool isPolyOprtr(int opTk)
-{
-    switch (opTk) {
-        // Assignment operators
+    // Arithmetic
+    case T_STAR:
+    case T_SLASH:
+    case T_PERCENT:
+    case T_AMPER:
+    case T_PIPE:
+    case T_CARET:
+    case T_LESS_LESS:
+    case T_GREATER_GREATER:
+        writer_->writeEquivRel(lhsTy, rhsTy);
+        writer_->writeEquivRel(types_.top(), lhsTy); // TODO: Use side with higher rank.
+        writer_->writeSubtypeRel(types_.top(), kIntTy);
+        break;
+
+    // Comparison
+    case T_LESS:
+    case T_LESS_EQUAL:
+    case T_GREATER:
+    case T_GREATER_EQUAL:
+    case T_EQUAL_EQUAL:
+    case T_EXCLAIM_EQUAL:
+        writer_->writeEquivRel(lhsTy, rhsTy);
+        writer_->writeEquivRel(types_.top(), kIntTy);
+        if (lhsDom == DomainLattice::Scalar && rhsDom == DomainLattice::Scalar) {
+            writer_->writeEquivRel(lhsTy, kScalarTy);
+            writer_->writeEquivRel(rhsTy, kScalarTy);
+        }
+        break;
+
+    // Logical
+    case T_AMPER_AMPER:
+    case T_PIPE_PIPE:
+        if (!isInconsistent()) {
+            writer_->writeEquivRel(types_.top(), kIntTy);
+            if (lhsDom == DomainLattice::Scalar)
+                writer_->writeSubtypeRel(lhsTy, kScalarTy);
+            if (rhsDom == DomainLattice::Scalar)
+                writer_->writeSubtypeRel(rhsTy, kScalarTy);
+        }
+        break;
+
     case T_EQUAL:
+        if (!isInconsistent()) {
+            writer_->writeSubtypeRel(lhsTy, rhsTy);
+            writer_->writeEquivRel(types_.top(), lhsTy);
+            if (lhsDom == DomainLattice::Scalar && rhsDom == DomainLattice::Scalar) {
+                writer_->writeSubtypeRel(lhsTy, kScalarTy);
+                writer_->writeSubtypeRel(rhsTy, kScalarTy);
+            }
+        }
+        break;
+
     case T_PLUS_EQUAL:
     case T_MINUS_EQUAL:
+        if (!isInconsistent()) {
+            if (lhsDom == DomainLattice::Pointer) {
+                writer_->writeEquivRel(types_.top(), lhsTy);
+            } else if (rhsDom == DomainLattice::Pointer) {
+                writer_->writeEquivRel(types_.top(), rhsTy);
+            } else if (lhsDom == DomainLattice::Scalar) {
+                writer_->writeEquivRel(types_.top(), lhsTy);
+                writer_->writeSubtypeRel(lhsTy, kScalarTy);
+                if (rhsDom == DomainLattice::Scalar)
+                    writer_->writeEquivRel(lhsTy, rhsTy);
+            } else if (rhsDom == DomainLattice::Scalar) {
+                writer_->writeEquivRel(types_.top(), rhsTy);
+                writer_->writeSubtypeRel(rhsTy, kScalarTy);
+                if (lhsDom == DomainLattice::Scalar)
+                    writer_->writeEquivRel(lhsTy, rhsTy);
+            } else {
+                writer_->writeEquivRel(types_.top(), lhsTy); // TODO: Use the highest rank.
+                writer_->writeEquivRel(lhsTy, rhsTy);
+            }
+        }
+        break;
+
     case T_STAR_EQUAL:
     case T_SLASH_EQUAL:
     case T_PERCENT_EQUAL:
-    case T_LESS_LESS_EQUAL:
-    case T_GREATER_GREATER_EQUAL:
-    case T_CARET_EQUAL:
     case T_AMPER_EQUAL:
     case T_PIPE_EQUAL:
-        return true;
-
-        // Additive operators
-    case T_PLUS:
-    case T_MINUS:
-        return true;
-
-        // Multiplicative operators
-    case T_STAR:
-    case T_SLASH:
-    case T_PERCENT:
-        return true;
-
-        // Bitwise operators
-    case T_AMPER:
-    case T_PIPE:
-    case T_CARET:
-        return true;
-
-        // Shift operators
-    case T_LESS_LESS:
-    case T_GREATER_GREATER:
-        return false;
-
-        // Logical operators
-    case T_AMPER_AMPER:
-    case T_PIPE_PIPE:
-        return true;
-
-        // Equality operators
-    case T_EXCLAIM_EQUAL:
-    case T_EQUAL_EQUAL:
-        return true;
-
-        // Relational operators.
-    case T_LESS:
-    case T_GREATER:
-    case T_LESS_EQUAL:
-    case T_GREATER_EQUAL:
-        return true;
+    case T_CARET_EQUAL:
+    case T_LESS_LESS_EQUAL:
+    case T_GREATER_GREATER_EQUAL:
+        writer_->writeEquivRel(lhsTy, rhsTy);
+        if (lhsDom > DomainLattice::Arithmetic)
+            writer_->writeEquivRel(types_.top(), lhsTy);
+        else if (rhsDom > DomainLattice::Arithmetic)
+            writer_->writeEquivRel(types_.top(), rhsTy);
+        else
+            writer_->writeEquivRel(types_.top(), kIntTy);
+        break;;
 
     default:
-        PSYCHE_ASSERT(false, return false, "unhandled binary operator");
+        PSYCHE_ASSERT(false, return, "unrecognized operator");
         break;
     }
 }
 
-/*!
- * \brief isPolyOprtrArithRet
- * \param opTk
- *
- * Return whether the return type of an expression involving the given operator
- * is of an arithmetic type.
- */
-bool isPolyOprtrArithRet(int opTk)
+DomainLattice::Domain ConstraintGenerator::domainOf(ExpressionAST *ast) const
 {
-    switch (opTk) {
-    case T_PLUS:
-    case T_MINUS:
-    case T_AMPER_AMPER:
-    case T_PIPE_PIPE:
-    case T_EXCLAIM_EQUAL:
-    case T_EQUAL_EQUAL:
-    case T_LESS:
-    case T_GREATER:
-    case T_LESS_EQUAL:
-    case T_GREATER_EQUAL:
-        return true;
-
-    default:
-        return false;
-    }
-}
-
-} // anonymous
-
-void ConstraintGenerator::applyTypeLattice(const ScalarTypeLattice::Class& lhsClass,
-                                           const ScalarTypeLattice::Class& rhsClass,
-                                           const std::string& lhsAlpha,
-                                           const std::string& rhsAlpha,
-                                           int opTk)
-{
-    // Now we decide whether we generate or discard the constraints for this
-    // binary expression. Whenever one of the operands is a pointer and the
-    // other is an arithmetic type (integral or floating point), the constraint
-    // is dropped so we don't trigger an "overunification".
-
-    if ((lhsClass == ScalarTypeLattice::Pointer
-         && (rhsClass == ScalarTypeLattice::Integral
-             || rhsClass == ScalarTypeLattice::FloatingPoint
-             || rhsClass == ScalarTypeLattice::Arithmetic
-             || rhsClass == ScalarTypeLattice::Scalar))
-            || ((lhsClass == ScalarTypeLattice::Integral
-                 || lhsClass == ScalarTypeLattice::FloatingPoint
-                 || lhsClass == ScalarTypeLattice::Arithmetic
-                 || lhsClass == ScalarTypeLattice::Scalar)
-                && (rhsClass == ScalarTypeLattice::Pointer))) {
-        printDebug("Discard constraint, %s x %s\n",
-                   lhsClass.name_.c_str(), rhsClass.name_.c_str());
-        writer_->writeTruth();
-        return;
-    }
-
-    printDebug("No constraint tweak, %s x %s\n",
-               lhsClass.name_.c_str(), rhsClass.name_.c_str());
-
-    // At this point, we know there's no conflict between pointers and
-    // arithmetic types. If either one of the sides is of an arithmetic
-    // type, then both are, we only need to pick a double or an int.
-    std::string actualArithTy = (lhsClass > rhsClass) ? lhsClass.arithName_
-                                                      : rhsClass.arithName_;
-
-    if (actualArithTy.empty()) {
-        if (lhsClass == ScalarTypeLattice::Integral
-                || rhsClass == ScalarTypeLattice::Integral
-                || lhsClass == ScalarTypeLattice::Arithmetic
-                || rhsClass == ScalarTypeLattice::Arithmetic) {
-            actualArithTy = kDefaultIntTy;
-        } else if (lhsClass == ScalarTypeLattice::FloatingPoint
-                   || rhsClass == ScalarTypeLattice::FloatingPoint) {
-            actualArithTy = kDefaultFloatPointTy;
+    DomainLattice::Domain dom = DomainLattice::Undefined;
+    if (lattice_) {
+        dom = lattice_->retrieveDomain(ast, scope_);
+        if (dom != DomainLattice::Undefined) {
+            const auto& s = lattice_->fetchText(ast);
+            printDebug("Retrieved AST %s as %s\n", s.c_str(), dom.name_.c_str());
         }
     }
 
-    // We must be careful with polymorphic operators such as `+' or `-' since
-    // they work on both pointers and integers. A constraint for a concrete
-    // type may only be generated in the case both operands are compatible.
-    if (isPolyOprtr(opTk)) {
-        if (opTk == T_EQUAL)
-            writer_->writeSubtypeRelation(lhsAlpha, rhsAlpha);
-        else
-            writer_->writeEquivRelation(lhsAlpha, rhsAlpha);
-
-        if (!actualArithTy.empty()) {
-            writer_->writeAnd();
-            writer_->writeEquivRelation(lhsAlpha, actualArithTy);
-        }
-        if (isPolyOprtrArithRet(opTk)) {
-            writer_->writeAnd();
-            writer_->writeEquivRelation(types_.top(),
-                                        actualArithTy.empty() ? kDefaultArithTy : actualArithTy);
-        }
-        return;
-    }
-
-    writer_->writeTruth();
-}
-
-ScalarTypeLattice::Class ConstraintGenerator::classOfExpr(ExpressionAST *ast) const
-{
-    const auto& s = lattice_.fetchText(ast);
-    auto clazz = lattice_.recover(ast);
-    if (clazz != ScalarTypeLattice::Undefined) {
-        printDebug("Recovered AST %s as %s\n", s.c_str(), clazz.name_.c_str());
-    } else {
-        TypeOfExpr typeofExpr(translationUnit());
+    if (dom == DomainLattice::Undefined) {
+        TypeOfExpression typeofExpr(translationUnit());
         FullySpecifiedType ty = typeofExpr.resolve(ast, scope_);
-        clazz = ScalarTypeLattice::classOf(ty);
-        printDebug("Typed AST %s as %s\n", s.c_str(), clazz.name_.c_str());
+        dom = DomainLattice::domainForType(ty);
+        // TODO: Fetch text utility.
+        const auto& s = lattice_->fetchText(ast);
+        printDebug("Typed AST %s as %s\n", s.c_str(), dom.name_.c_str());
     }
 
-    return clazz;
+    return dom;
 }
-
 
 bool ConstraintGenerator::visit(ArrayAccessAST *ast)
 {
     DEBUG_VISIT(ArrayAccessAST);
-    CLASSIFY(ast);
+    OBSERVE(ArrayAccessAST);
 
     std::tuple<std::string, std::string, std::string> a1a2a3 = supply_.createTypeVar3();
-    writer_->writeNewTypeVar(std::get<0>(a1a2a3));
-    writer_->writeNewTypeVar(std::get<1>(a1a2a3));
-    writer_->writeNewTypeVar(std::get<2>(a1a2a3));
+    writer_->writeExists(std::get<0>(a1a2a3));
+    writer_->writeExists(std::get<1>(a1a2a3));
+    writer_->writeExists(std::get<2>(a1a2a3));
     collectExpression(std::get<0>(a1a2a3), ast->base_expression);
-
-    writer_->writeAnd();
     collectExpression(std::get<1>(a1a2a3), ast->expression);
 
-    writer_->writeAnd();
-    writer_->writePointerRelation(std::get<0>(a1a2a3), std::get<2>(a1a2a3));
-
-    writer_->writeAnd();
+    writer_->writePtrRel(std::get<0>(a1a2a3), std::get<2>(a1a2a3));
     ENSURE_NONEMPTY_TYPE_STACK(return false);
-    writer_->writeEquivRelation(types_.top(), std::get<2>(a1a2a3));
+    writer_->writeEquivRel(types_.top(), std::get<2>(a1a2a3));
 
-    writer_->writeAnd();
-    writer_->writeEquivRelation(std::get<1>(a1a2a3), kDefaultIntTy);
+    writer_->writeEquivRel(std::get<1>(a1a2a3), kSizeTy);
 
     return false;
 }
@@ -726,56 +680,40 @@ bool ConstraintGenerator::visit(ArrayAccessAST *ast)
 bool ConstraintGenerator::visit(BinaryExpressionAST *ast)
 {
     DEBUG_VISIT(BinaryExpressionAST);
-    CLASSIFY(ast);
+    OBSERVE(BinaryExpressionAST);
 
-    // A comma expression is irrelevant for us. We consider it merely as a
-    // sequence of unrelated expressions.
-    unsigned opTk = tokenKind(ast->binary_op_token);
-    if (opTk == T_COMMA) {
-        visitExpression(ast->left_expression);
-        if (ast->right_expression) {
-            writer_->writeAnd(true);
-            visitExpression(ast->right_expression);
-        }
+    ExpressionAST* lexpr = ast->left_expression;
+    ExpressionAST* rexpr = ast->right_expression;
+
+    // A comma expression is just a  sequence of unrelated expressions.
+    unsigned op = tokenKind(ast->binary_op_token);
+    if (op == T_COMMA) {
+        visitExpression(lexpr);
+
+        const std::string& alpha = supply_.createTypeVar1();
+        writer_->writeExists(alpha);
+        collectExpression(alpha, rexpr);
         return false;
     }
 
-    // We don't know the underlying element type of the pointer, but we can
-    // at least constrain the left-hand-side as a pointer.
-    ExpressionAST* left = stripParen(ast->left_expression);
-    ExpressionAST* right = stripParen(ast->right_expression);
-    if (right->asPointerLiteral()) {
+    // With NULL, we don't know the underlying element type of the pointer, but we can
+    // constrain the left-hand-side as a pointer.
+    if (rexpr->asPointerLiteral()) {
         std::tuple<std::string, std::string> a1a2 = supply_.createTypeVar2();
-        writer_->writeNewTypeVar(std::get<0>(a1a2));
-        writer_->writeNewTypeVar(std::get<1>(a1a2));
-        collectExpression(std::get<0>(a1a2), left);
-        writer_->writeAnd();
-        writer_->writePointerRelation(std::get<0>(a1a2), std::get<1>(a1a2));
+        writer_->writeExists(std::get<0>(a1a2));
+        writer_->writeExists(std::get<1>(a1a2));
+        collectExpression(std::get<0>(a1a2), lexpr);
+        writer_->writePtrRel(std::get<0>(a1a2), std::get<1>(a1a2));
         return false;
     }
 
     std::tuple<std::string, std::string> a1a2 = supply_.createTypeVar2();
-    writer_->writeNewTypeVar(std::get<0>(a1a2));
-    writer_->writeNewTypeVar(std::get<1>(a1a2));
-    collectExpression(std::get<0>(a1a2), left);
-    writer_->writeAnd();
-    collectExpression(std::get<1>(a1a2), right);
-    writer_->writeAnd();
+    writer_->writeExists(std::get<0>(a1a2));
+    writer_->writeExists(std::get<1>(a1a2));
+    collectExpression(std::get<0>(a1a2), lexpr);
+    collectExpression(std::get<1>(a1a2), rexpr);
 
-    applyTypeLattice(classOfExpr(left), classOfExpr(right),
-                     std::get<0>(a1a2), std::get<1>(a1a2),
-                     opTk);
-
-    if (!isPolyOprtr(opTk)) {
-        writer_->writeAnd();
-        writer_->writeTypeof(nonPolyOprtrName(opTk));
-        writer_->writeTypeEquiv();
-        writer_->enterGroup();
-        ENSURE_NONEMPTY_TYPE_STACK(return false);
-        writer_->writeTypeNames(
-        { std::get<0>(a1a2), std::get<1>(a1a2), types_.top() });
-        writer_->leaveGroup();
-    }
+    employLattice(domainOf(lexpr), domainOf(rexpr), std::get<0>(a1a2), std::get<1>(a1a2), op);
 
     return false;
 }
@@ -799,56 +737,52 @@ const std::string trivialName(IdExpressionAST* idExpr)
 bool ConstraintGenerator::visit(CallAST *ast)
 {
     DEBUG_VISIT(CallAST);
-    CLASSIFY(ast);
+    OBSERVE(CallAST);
 
     std::string funcName;
     int varArgPos = -1;
     if (ast->base_expression->asIdExpression()) {
         funcName = trivialName(ast->base_expression->asIdExpression());
 
-        // Detect whether the function is registered as a variadic one.
+        // Detect whether the function is registered as a printf-style one.
         auto fit = printfs_.find(funcName);
         if (fit != printfs_.end())
             varArgPos = fit->second;
     } else {
         const std::string& funcVar = supply_.createTypeVar1();
-        writer_->writeNewTypeVar(funcVar);
+        writer_->writeExists(funcVar);
         collectExpression(funcVar, ast->base_expression);
-
         funcName = createUnnamed(stubPrefix_);
-        writer_->writeAnd();
+        writer_->beginSection();
         writer_->writeTypeof(funcName);
-        writer_->writeTypeEquiv();
-        writer_->writeTypeName(funcVar);
-        writer_->writeAnd();
+        writer_->writeEquivMark();
+        writer_->writeTypeSection(funcVar);
+        writer_->endSection();
     }
 
     // Deal with "regular" functions, for which we generate constraints through
     // the normal expression inspection process.
-    if (varArgPos == -1) {
-        std::vector<std::string> typeVars;
-        for (ExpressionListAST* it = ast->expression_list; it; it = it->next) {
-            const std::string& typeVar = supply_.createTypeVar1();
-            writer_->writeNewTypeVar(typeVar);
-            collectExpression(typeVar, it->value);
-            typeVars.push_back(typeVar);
-            if (it->next)
-                writer_->writeAnd(true);
-        }
-        ENSURE_NONEMPTY_TYPE_STACK(return false);
-        typeVars.push_back(types_.top());
-
-
-        if (ast->expression_list)
-            writer_->writeAnd();
-        writer_->writeTypeof(funcName);
-        writer_->writeTypeEquiv();
-        writer_->enterGroup();
-        writer_->writeTypeNames(typeVars);
-        writer_->leaveGroup();
-
-        return false;
+    std::vector<std::string> typeVars;
+    for (ExpressionListAST* it = ast->expression_list; it; it = it->next) {
+        const std::string& typeVar = supply_.createTypeVar1();
+        writer_->writeExists(typeVar);
+        collectExpression(typeVar, it->value);
+        typeVars.push_back(typeVar);
     }
+    ENSURE_NONEMPTY_TYPE_STACK(return false);
+    typeVars.push_back(types_.top());
+
+    writer_->beginSection();
+    writer_->writeTypeof(funcName);
+    writer_->writeEquivMark();
+    writer_->enterGroup();
+    writer_->writeTypesSection(typeVars);
+    writer_->leaveGroup();
+    writer_->endSection();
+
+
+    if (varArgPos == -1)
+        return false;
 
     // Deal with printf family of functions, for which we generate constraints
     // based on format specifiers.
@@ -857,10 +791,8 @@ bool ConstraintGenerator::visit(CallAST *ast)
     for (ExpressionListAST* it = ast->expression_list; it; it = it->next, ++argCnt) {
         if (argCnt < varArgPos) {
             const std::string& typeVar = supply_.createTypeVar1();
-            writer_->writeNewTypeVar(typeVar);
+            writer_->writeExists(typeVar);
             collectExpression(typeVar, it->value);
-            if (it->next)
-                writer_->writeAnd(true);
             continue;
         }
 
@@ -922,18 +854,19 @@ bool ConstraintGenerator::visit(CallAST *ast)
                 collectExpression(kDefaultStrTy, it->value);
                 break;
 
+            case PrintfScanner::Pointer:
+                // We don't know the underlying pointer type, nothing interesting to do.
+                break;
+
             default:
                 PSYCHE_ASSERT(false, return false, "unknown type spec");
                 break;
             }
-            if (it->next)
-                writer_->writeAnd();
         }
     }
 
     return false;
 }
-
 
 void ConstraintGenerator::castExpressionHelper(const std::string& inputTy,
                                                std::string& resultTy)
@@ -945,44 +878,57 @@ void ConstraintGenerator::castExpressionHelper(const std::string& inputTy,
             && resultTy != kLongLongTy
             && resultTy != kFloatTy
             && resultTy != kDoubleTy
-            && resultTy != kLongDouble
+            && resultTy != kLongDoubleTy
             && resultTy != kVoidTy
             && resultTy != kDefaultStrTy) {
         ensureTypeIsKnown(resultTy);
     }
     ENSURE_NONEMPTY_TYPE_STACK(return );
-    writer_->writeEquivRelation(inputTy, resultTy);
+    writer_->writeEquivRel(inputTy, resultTy);
 }
 
 bool ConstraintGenerator::visit(CastExpressionAST *ast)
 {
     DEBUG_VISIT(CastExpressionAST);
-    CLASSIFY(ast);
+    OBSERVE(CastExpressionAST);
 
-    std::string ty = typeSpeller_.spellTypeName(ast->expression_type, scope_);
+    std::string ty = typeSpeller_.spell(ast->expression_type, scope_);
     castExpressionHelper(types_.top(), ty);
 
-    writer_->writeAnd();
     const std::string& alpha = supply_.createTypeVar1();
-    writer_->writeNewTypeVar(alpha);
+    writer_->writeExists(alpha);
     collectExpression(alpha, ast->expression);
+
+    auto targetDom = domainOf(ast->type_id);
+
+    if (targetDom != DomainLattice::Undefined)
+        writer_->writeSubtypeRel(alpha, kScalarTy);
 
     return false;
 }
 
-void ConstraintGenerator::convertBoolExpression(ExpressionAST *ast)
+void ConstraintGenerator::treatAsBool(ExpressionAST *ast)
 {
+    if (!ast)
+        return;
+
     std::string ty;
-    auto clazz = classOfExpr(ast);
-    if (clazz == ScalarTypeLattice::Arithmetic) {
-        ty = kDefaultArithTy;
-    } else if (clazz == ScalarTypeLattice::Integral) {
-        ty = kDefaultIntTy;
-    } else if (clazz == ScalarTypeLattice::FloatingPoint) {
-        ty = kDefaultFloatPointTy;
+    auto dom = domainOf(ast);
+    if (!dom.ty_.empty()) {
+        ty = dom.ty_;
     } else {
-        ty = supply_.createTypeVar1();
-        writer_->writeNewTypeVar(ty);
+        if (dom == DomainLattice::Arithmetic) {
+            ty = kDefaultArithTy;
+        } else if (dom == DomainLattice::Integral) {
+            ty = kDefaultIntTy;
+        } else if (dom == DomainLattice::FloatingPoint) {
+            ty = kDefaultFloatPointTy;
+        } else {
+            ty = supply_.createTypeVar1();
+            writer_->writeExists(ty);
+            if (dom == DomainLattice::Scalar)
+                writer_->writeSubtypeRel(ty, kScalarTy);
+        }
     }
 
     collectExpression(ty, ast);
@@ -991,13 +937,10 @@ void ConstraintGenerator::convertBoolExpression(ExpressionAST *ast)
 bool ConstraintGenerator::visit(ConditionalExpressionAST *ast)
 {
     DEBUG_VISIT(ConditionalExpressionAST);
-    CLASSIFY(ast);
+    OBSERVE(ConditionalExpressionAST);
 
-    convertBoolExpression(ast->condition);
-
-    writer_->writeAnd();
+    treatAsBool(ast->condition);
     visitExpression(ast->left_expression);
-    writer_->writeAnd();
     visitExpression(ast->right_expression);
 
     return false;
@@ -1006,15 +949,13 @@ bool ConstraintGenerator::visit(ConditionalExpressionAST *ast)
 bool ConstraintGenerator::visit(IdExpressionAST *ast)
 {
     DEBUG_VISIT(IdExpressionAST);
-    CLASSIFY(ast);
+    OBSERVE(IdExpressionAST);
 
-    processSymbol(extractId(ast->name->name));
+    assignTop(extractId(ast->name->name));
 
-    if (staticDecl_) {
-        // Static initialization requires a compile-time constant.
-        writer_->writeAnd();
-        writer_->writeReadOnly(extractId(ast->name->name));
-    }
+    // Static initialization requires a compile-time constant.
+    if (staticDecl_)
+        writer_->writeConstantExpression(extractId(ast->name->name));
 
     return false;
 }
@@ -1022,27 +963,43 @@ bool ConstraintGenerator::visit(IdExpressionAST *ast)
 bool ConstraintGenerator::visit(NumericLiteralAST *ast)
 {
     DEBUG_VISIT(NumericLiteralAST);
-    CLASSIFY(ast);
+    OBSERVE(NumericLiteralAST);
 
     const NumericLiteral *numLit = numericLiteral(ast->literal_token);
     PSYCHE_ASSERT(numLit, return false, "numeric literal must exist");
-    if (numLit->isDouble()
-            || numLit->isFloat()
-            || numLit->isLongDouble()) {
-        writer_->writeTypeName(kDefaultFloatPointTy);
+
+    std::string ty;
+    if (numLit->isUnsigned())
+        ty.append(" unsigned ");
+
+    writer_->beginSection();
+    if (numLit->isDouble()) {
+        ty.append(kDoubleTy);
+    } else if (numLit->isFloat()) {
+        ty.append(kFloatTy);
+    } else if (numLit->isLongDouble()) {
+        ty.append(kLongDoubleTy);
     } else {
         if (!strcmp(numLit->chars(), "0")) {
-            ENSURE_NONEMPTY_TYPE_STACK(return false);
-            writer_->writeTypeName(types_.top());
+            const std::string& alpha = supply_.createTypeVar1();
+            writer_->writeExists(alpha);
+            ty.append(alpha);
         } else if (tokenKind(ast->literal_token) == T_CHAR_LITERAL) {
-            writer_->writeTypeName(kCharTy);
+            // TODO: char/int
+            ty.append(kCharTy);
+        } else if (numLit->isLong()) {
+            ty.append(kLongTy);
+        } else if (numLit->isLongLong()) {
+            ty.append(kLongLongTy);
         } else {
-            writer_->writeTypeName(kDefaultIntTy);
+            ty.append(kDefaultIntTy);
         }
     }
-    writer_->writeTypeEquiv();
+    writer_->writeTypeSection(ty);
+    writer_->writeEquivMark();
     ENSURE_NONEMPTY_TYPE_STACK(return false);
-    writer_->writeTypeName(types_.top());
+    writer_->writeTypeSection(types_.top());
+    writer_->endSection();
 
     return false;
 }
@@ -1050,12 +1007,12 @@ bool ConstraintGenerator::visit(NumericLiteralAST *ast)
 bool ConstraintGenerator::visit(BoolLiteralAST *ast)
 {
     DEBUG_VISIT(BoolLiteralAST);
-    CLASSIFY(ast);
+    OBSERVE(BoolLiteralAST);
 
     // Treated as integer. It's relatively common to have C code defining `true`
     // and `false` through macros. Their meaning is obvious in such cases.
     ENSURE_NONEMPTY_TYPE_STACK(return false);
-    writer_->writeEquivRelation(kDefaultIntTy, types_.top());
+    writer_->writeEquivRel(kDefaultIntTy, types_.top());
 
     return false;
 }
@@ -1063,10 +1020,10 @@ bool ConstraintGenerator::visit(BoolLiteralAST *ast)
 bool ConstraintGenerator::visit(StringLiteralAST *ast)
 {
     DEBUG_VISIT(StringLiteralAST);
-    CLASSIFY(ast);
+    OBSERVE(StringLiteralAST);
 
     ENSURE_NONEMPTY_TYPE_STACK(return false);
-    writer_->writeEquivRelation(kDefaultStrTy, types_.top());
+    writer_->writeEquivRel(kDefaultStrTy, types_.top());
 
     return false;
 }
@@ -1074,40 +1031,36 @@ bool ConstraintGenerator::visit(StringLiteralAST *ast)
 bool ConstraintGenerator::visit(MemberAccessAST *ast)
 {
     DEBUG_VISIT(MemberAccessAST);
-    CLASSIFY(ast);
+    OBSERVE(MemberAccessAST);
 
     std::tuple<std::string, std::string> a1a2 = supply_.createTypeVar2();
-    writer_->writeNewTypeVar(std::get<0>(a1a2));
-    writer_->writeNewTypeVar(std::get<1>(a1a2));
+    writer_->writeExists(std::get<0>(a1a2));
+    writer_->writeExists(std::get<1>(a1a2));
 
     std::string alpha3;
     unsigned accessTk = tokenKind(ast->access_token);
     if (accessTk == T_ARROW)  {
         alpha3 = supply_.createTypeVar1();
-        writer_->writeNewTypeVar(alpha3);
+        writer_->writeExists(alpha3);
     }
 
     collectExpression(std::get<0>(a1a2), ast->base_expression);
 
     // For a pointer access we need to insert an additional constraint.
-    if (accessTk == T_ARROW) {
-        writer_->writeAnd();
-        writer_->writePointerRelation(std::get<0>(a1a2), std::get<1>(a1a2));
-    }
+    if (accessTk == T_ARROW)
+        writer_->writePtrRel(std::get<0>(a1a2), std::get<1>(a1a2));
 
     std::string sym = extractId(ast->member_name->name);
-    writer_->writeAnd();
     if (accessTk == T_ARROW)
-        writer_->writeMemberRelation(std::get<1>(a1a2), sym, alpha3);
+        writer_->writeMemberRel(std::get<1>(a1a2), sym, alpha3);
     else
-        writer_->writeMemberRelation(std::get<0>(a1a2), sym, std::get<1>(a1a2));
+        writer_->writeMemberRel(std::get<0>(a1a2), sym, std::get<1>(a1a2));
 
-    writer_->writeAnd();
     ENSURE_NONEMPTY_TYPE_STACK(return false);
     if (accessTk == T_ARROW)
-        writer_->writeEquivRelation(types_.top(), alpha3);
+        writer_->writeEquivRel(types_.top(), alpha3);
     else
-        writer_->writeEquivRelation(types_.top(), std::get<1>(a1a2));
+        writer_->writeEquivRel(types_.top(), std::get<1>(a1a2));
 
     return false;
 }
@@ -1115,26 +1068,51 @@ bool ConstraintGenerator::visit(MemberAccessAST *ast)
 bool ConstraintGenerator::visit(BracedInitializerAST *ast)
 {
     DEBUG_VISIT(BracedInitializerAST);
-    CLASSIFY(ast);
+    OBSERVE(BracedInitializerAST);
 
     const std::string& alpha = supply_.createTypeVar1();
-    writer_->writeNewTypeVar(alpha);
+    writer_->writeExists(alpha);
 
     auto cnt = 0;
     for (auto it = ast->expression_list; it; it = it->next, ++cnt) {
-        const std::string& member = supply_.createTypeVar1();
-        writer_->writeNewTypeVar(member);
-        collectExpression(member, it->value);
-        writer_->writeAnd();
-        // TODO: We need a member name placeholder!
-        writer_->writeMemberRelation(alpha, "member_" + std::to_string(cnt), member);
-        if (it->next)
-            writer_->writeAnd();
+        std::string alphaField = supply_.createTypeVar1();
+        writer_->writeExists(alphaField);
+        collectExpression(alphaField, it->value);
+
+        if (it->value->asDesignatedInitializer()) {
+            auto init = it->value->asDesignatedInitializer();
+
+            // Traverse the designators list from right to left, creating, for each name,
+            // a corresponding type. The first type comes from the intializer expression.
+            std::vector<DesignatorAST*> designators;
+            for (DesignatorListAST* it2 = init->designator_list; it2; it2 = it2->next)
+                designators.push_back(it2->value);
+            std::reverse(designators.begin(), designators.end());
+
+            std::string alphaDesig;
+            for (auto i = 0u; i < designators.size(); ++i) {
+                auto design = designators[i];
+                if (design->asDotDesignator()) {
+                    alphaDesig = supply_.createTypeVar1();
+                    writer_->writeExists(alphaDesig);
+
+                    const Identifier* field =
+                        identifier(design->asDotDesignator()->identifier_token);
+                    writer_->writeMemberRel(alphaDesig, std::string(field->chars(),
+                                                                    field->size()), alphaField);
+                    alphaField = alphaDesig;
+                } else {
+                    // TODO: Arrays.
+                }
+            }
+            writer_->writeEquivRel(alphaDesig, alpha);
+        } else {
+            writer_->writeMemberRel(alpha, "member_" + std::to_string(cnt), alphaField);
+        }
     }
 
-    writer_->writeAnd();
     ENSURE_NONEMPTY_TYPE_STACK(return false);
-    writer_->writeEquivRelation(types_.top(), alpha);
+    writer_->writeEquivRel(types_.top(), alpha);
 
     return false;
 }
@@ -1142,10 +1120,10 @@ bool ConstraintGenerator::visit(BracedInitializerAST *ast)
 bool ConstraintGenerator::visit(PostIncrDecrAST *ast)
 {
     DEBUG_VISIT(PostIncrDecrAST);
-    CLASSIFY(ast);
+    OBSERVE(PostIncrDecrAST);
 
     const std::string& alpha = supply_.createTypeVar1();
-    writer_->writeNewTypeVar(alpha);
+    writer_->writeExists(alpha);
     collectExpression(alpha, ast->base_expression);
 
     return false;
@@ -1154,38 +1132,39 @@ bool ConstraintGenerator::visit(PostIncrDecrAST *ast)
 bool ConstraintGenerator::visit(UnaryExpressionAST* ast)
 {
     DEBUG_VISIT(UnaryExpressionAST);
-    CLASSIFY(ast);
+    OBSERVE(UnaryExpressionAST);
 
     switch(tokenKind(ast->unary_op_token)) {
     case T_AMPER: {
         std::tuple<std::string, std::string> a1a2 = supply_.createTypeVar2();
-        writer_->writeNewTypeVar(std::get<0>(a1a2));
-        writer_->writeNewTypeVar(std::get<1>(a1a2));
+        writer_->writeExists(std::get<0>(a1a2));
+        writer_->writeExists(std::get<1>(a1a2));
         collectExpression(std::get<1>(a1a2), ast->expression);
 
-        writer_->writeAnd();
-        writer_->writePointerRelation(std::get<0>(a1a2), std::get<1>(a1a2));
+        writer_->writePtrRel(std::get<0>(a1a2), std::get<1>(a1a2));
 
-        writer_->writeAnd();
         ENSURE_NONEMPTY_TYPE_STACK(return false);
-        writer_->writeEquivRelation(types_.top(), std::get<0>(a1a2));
+        writer_->writeEquivRel(types_.top(), std::get<0>(a1a2));
         break;
     }
 
     case T_STAR: {
         const std::string& alpha = supply_.createTypeVar1();
-        writer_->writeNewTypeVar(alpha);
+        writer_->writeExists(alpha);
         collectExpression(alpha, ast->expression);
-        writer_->writeAnd();
+
         ENSURE_NONEMPTY_TYPE_STACK(return false);
-        writer_->writePointerRelation(alpha, types_.top());
+        writer_->writePtrRel(alpha, types_.top());
         break;
     }
 
     case T_EXCLAIM: {
         const std::string& alpha = supply_.createTypeVar1();
-        writer_->writeNewTypeVar(alpha);
+        writer_->writeExists(alpha);
         collectExpression(alpha, ast->expression);
+
+        ENSURE_NONEMPTY_TYPE_STACK(return false);
+        writer_->writeEquivRel(types_.top(), kDefaultIntTy);
         break;
     }
 
@@ -1201,26 +1180,32 @@ bool ConstraintGenerator::visit(UnaryExpressionAST* ast)
 bool ConstraintGenerator::visit(SizeofExpressionAST *ast)
 {
     DEBUG_VISIT(SizeofExpressionAST);
-    CLASSIFY(ast);
+    OBSERVE(SizeofExpressionAST);
 
-    // We don't traverse neither the expression nor the type specifier
-    // possibly within the size of. There's nothing we can really get for now.
+    // When sizeof's argument is a type, we need to make sure it exists.
+    if (ast->expression->asTypeId()) {
+        const std::string& alpha = supply_.createTypeVar1();
+        writer_->writeExists(alpha);
+        const std::string& ty = typeSpeller_.spell(ast->expression_type, scope_);
+        writer_->writeTypedef(ty, alpha);
+    }
+
+    // TODO: Make sizeof and related type as size_t.
     ENSURE_NONEMPTY_TYPE_STACK(return false);
-    writer_->writeEquivRelation(types_.top(), kDefaultIntTy);
+    writer_->writeEquivRel(types_.top(), kDefaultIntTy);
 
     return false;
 }
 
-bool ConstraintGenerator::visit(CPlusPlus::PointerLiteralAST* ast)
+bool ConstraintGenerator::visit(psyche::PointerLiteralAST* ast)
 {
     DEBUG_VISIT(PointerLiteralAST);
-    CLASSIFY(ast);
 
     // We don't know the underlying element type, but we know it's a pointer.
     const std::string& alpha = supply_.createTypeVar1();
-    writer_->writeNewTypeVar(alpha);
+    writer_->writeExists(alpha);
     ENSURE_NONEMPTY_TYPE_STACK(return false);
-    writer_->writePointerRelation(types_.top(), alpha);
+    writer_->writePtrRel(types_.top(), alpha);
 
     return false;
 }
@@ -1235,14 +1220,15 @@ void ConstraintGenerator::visitSpecifier(SpecifierAST *ast)
 bool ConstraintGenerator::visit(EnumSpecifierAST *ast)
 {
     DEBUG_VISIT(EnumSpecifierAST);
+    OBSERVE(EnumSpecifierAST);
 
     for (SpecifierListAST *it = ast->type_specifier_list; it; it = it->next)
         visitSpecifier(it->value);
 
-    Scope *previousScope = switchScope(ast->symbol);
+    Scope *prevScope = switchScope(ast->symbol);
     for (EnumeratorListAST *it = ast->enumerator_list; it; it = it->next)
-        visitExpression(it->value->expression);
-    switchScope(previousScope);
+        accept(it->value);
+    switchScope(prevScope);
 
     return false;
 }
@@ -1250,25 +1236,37 @@ bool ConstraintGenerator::visit(EnumSpecifierAST *ast)
 bool ConstraintGenerator::visit(ClassSpecifierAST* ast)
 {
     DEBUG_VISIT(ClassSpecifierAST);
+    OBSERVE(ClassSpecifierAST);
 
-    const std::string record = "struct " + extractId(ast->name->name);
+    std::string classTy = typeSpeller_.spell(ast->symbol->type(), scope_);
+    std::string tyName;
+    if (ast->name->name->asAnonymousNameId()) {
+        tyName = classTy;
+    } else {
+        std::string head = "struct ";
+        if (tokenKind(ast->classkey_token) == T_UNION)
+            head = "union ";
+        tyName = head + extractId(ast->name->name);
+    }
 
-    std::string classTy = typeSpeller_.spellTypeName(ast->symbol->type(), scope_);
-    writer_->writeTypedef(record, classTy);
-    writer_->writeAnd(true);
+    writer_->writeTypedef(tyName, classTy);
 
     const std::string& alpha = supply_.createTypeVar1();
-    writer_->writeNewTypeVar(alpha);
-    writer_->writeEquivRelation(alpha, record);
-    writer_->writeAnd(true);
+    writer_->writeExists(alpha);
+    writer_->writeEquivRel(alpha, tyName);
 
     structs_.push(alpha);
-    Scope *previousScope = switchScope(ast->symbol);
+    Scope *prevScope = switchScope(ast->symbol);
     for (DeclarationListAST *it = ast->member_specifier_list; it; it = it->next)
         visitDeclaration(it->value);
-    switchScope(previousScope);
+    switchScope(prevScope);
     structs_.pop();
 
+    return false;
+}
+
+bool ConstraintGenerator::visit(GnuAttributeSpecifierAST *ast)
+{
     return false;
 }
 
@@ -1282,11 +1280,14 @@ void ConstraintGenerator::visitStatement(StatementAST *ast)
 bool ConstraintGenerator::visit(CompoundStatementAST *ast)
 {
     DEBUG_VISIT(CompoundStatementAST);
+    OBSERVE(CompoundStatementAST);
 
-    Scope *previousScope = switchScope(ast->symbol);
+    writer_->openScope();
+    Scope *prevScope = switchScope(ast->symbol);
     for (StatementListAST *it = ast->statement_list; it; it = it->next)
         visitStatement(it->value);
-    switchScope(previousScope);
+    switchScope(prevScope);
+    writer_->closeScope();
 
     return false;
 }
@@ -1294,10 +1295,9 @@ bool ConstraintGenerator::visit(CompoundStatementAST *ast)
 bool ConstraintGenerator::visit(DeclarationStatementAST *ast)
 {
     DEBUG_VISIT(DeclarationStatementAST);
+    OBSERVE(DeclarationStatementAST);
 
-    maybeFollowStmt();
     visitDeclaration(ast->declaration);
-    seenStmt_ = false; // Actually a declaration (unset the stmt seen flag).
 
     return false;
 }
@@ -1305,33 +1305,17 @@ bool ConstraintGenerator::visit(DeclarationStatementAST *ast)
 bool ConstraintGenerator::visit(ExpressionStatementAST *ast)
 {
     DEBUG_VISIT(ExpressionStatementAST);
+    OBSERVE(ExpressionStatementAST);
 
     if (!ast->expression)
         return false;
 
-    CLASSIFY(ast->expression);
-    maybeFollowStmt();
-
-    // Deal with an assignment.
+    // Deal with assignment.
     if (ast->expression->asBinaryExpression()) {
-        switch (tokenKind(ast->expression->asBinaryExpression()->binary_op_token)) {
-        case T_EQUAL:
-        case T_PLUS_EQUAL:
-        case T_MINUS_EQUAL:
-        case T_STAR_EQUAL:
-        case T_SLASH_EQUAL:
-        case T_PERCENT_EQUAL:
-        case T_LESS_LESS_EQUAL:
-        case T_GREATER_GREATER_EQUAL:
-        case T_CARET_EQUAL:
-        case T_AMPER_EQUAL:
-        case T_PIPE_EQUAL:
-            visitExpression(ast->expression);
-            return false;
-
-        default:
-            break;
-        }
+        const std::string& alpha = supply_.createTypeVar1();
+        writer_->writeExists(alpha);
+        collectExpression(alpha, ast->expression);
+        return false;
     }
 
     // Deal with a pointer dereference.
@@ -1339,16 +1323,15 @@ bool ConstraintGenerator::visit(ExpressionStatementAST *ast)
             && (tokenKind(ast->expression->asUnaryExpression()->unary_op_token)
             == T_STAR)) {
         std::tuple<std::string, std::string> a1a2 = supply_.createTypeVar2();
-        writer_->writeNewTypeVar(std::get<0>(a1a2));
-        writer_->writeNewTypeVar(std::get<1>(a1a2));
+        writer_->writeExists(std::get<0>(a1a2));
+        writer_->writeExists(std::get<1>(a1a2));
         collectExpression(std::get<0>(a1a2), ast->expression->asUnaryExpression()->expression);
-        writer_->writeAnd();
-        writer_->writePointerRelation(std::get<0>(a1a2), std::get<1>(a1a2));
+        writer_->writePtrRel(std::get<0>(a1a2), std::get<1>(a1a2));
         return false;
     }
 
     const std::string& alpha = supply_.createTypeVar1();
-    writer_->writeNewTypeVar(alpha);
+    writer_->writeExists(alpha);
     collectExpression(alpha, ast->expression);
 
     // In the case of a function call, we try to find out what's the actual
@@ -1360,12 +1343,10 @@ bool ConstraintGenerator::visit(ExpressionStatementAST *ast)
         const std::string& funcName =
                 trivialName(ast->expression->asCall()->base_expression->asIdExpression());
         const auto it = knownFuncNames_.find(funcName);
-        if (it != knownFuncNames_.end()) {
-            writer_->writeAnd();
-            writer_->writeEquivRelation(alpha, it->second);
-        } else {
+        if (it != knownFuncNames_.end())
+            writer_->writeEquivRel(alpha, it->second);
+        else
             knownFuncRets_[funcName].push_back(alpha);
-        }
     }
 
     return false;
@@ -1374,16 +1355,13 @@ bool ConstraintGenerator::visit(ExpressionStatementAST *ast)
 bool ConstraintGenerator::visit(IfStatementAST *ast)
 {
     DEBUG_VISIT(IfStatementAST);
-    CLASSIFY(ast->condition);
+    OBSERVE(IfStatementAST);
 
-    maybeFollowStmt();
-    convertBoolExpression(ast->condition);
-
-    if (ast->statement)
-        visitStatement(ast->statement);
-
-    if (ast->else_statement)
-        visitStatement(ast->else_statement);
+    Scope* prevScope = switchScope(ast->symbol);
+    treatAsBool(ast->condition);
+    visitStatement(ast->statement);
+    visitStatement(ast->else_statement);
+    switchScope(prevScope);
 
     return false;
 }
@@ -1391,9 +1369,9 @@ bool ConstraintGenerator::visit(IfStatementAST *ast)
 bool ConstraintGenerator::visit(ReturnStatementAST *ast)
 {
     DEBUG_VISIT(ReturnStatementAST);
+    OBSERVE(ReturnStatementAST);
 
     if (ast->expression) {
-        maybeFollowStmt();
         visitExpression(ast->expression);
 
         ENSURE_NONEMPTY_ALPHA_RET_STACK(return false);
@@ -1403,15 +1381,32 @@ bool ConstraintGenerator::visit(ReturnStatementAST *ast)
     return false;
 }
 
+bool ConstraintGenerator::visit(EnumeratorAST *ast)
+{
+    DEBUG_VISIT(EnumeratorAST);
+    OBSERVE(EnumeratorAST);
+
+    const Identifier* ident = identifier(ast->identifier_token);
+    writer_->writeVarDecl(ident->chars(), kIntTy);
+
+    if (ast->expression) {
+        collectExpression(kIntTy, ast->expression);
+
+        // TODO: Extend...
+        if (ast->expression->asIdExpression())
+            writer_->writeConstantExpression(extractId(ast->expression->asIdExpression()->name->name));
+    }
+
+    return false;
+}
+
 bool ConstraintGenerator::visit(SwitchStatementAST *ast)
 {
     DEBUG_VISIT(SwitchStatementAST);
+    OBSERVE(SwitchStatementAST);
 
-    maybeFollowStmt();
-    convertBoolExpression(ast->condition);
-
-    if (ast->statement)
-        visitStatement(ast->statement);
+    treatAsBool(ast->condition);
+    visitStatement(ast->statement);
 
     return false;
 }
@@ -1419,16 +1414,15 @@ bool ConstraintGenerator::visit(SwitchStatementAST *ast)
 bool ConstraintGenerator::visit(CaseStatementAST *ast)
 {
     DEBUG_VISIT(CaseStatementAST);
+    OBSERVE(CaseStatementAST);
 
-    maybeFollowStmt();
     collectExpression(kDefaultIntTy, ast->expression);
-    if (ast->expression->asIdExpression()) {
-        writer_->writeAnd();
-        writer_->writeReadOnly(extractId(ast->expression->asIdExpression()->name->name));
-    }
 
-    if (ast->statement)
-        visitStatement(ast->statement);
+    // TODO: Extend...
+    if (ast->expression->asIdExpression())
+        writer_->writeConstantExpression(extractId(ast->expression->asIdExpression()->name->name));
+
+    visitStatement(ast->statement);
 
     return false;
 }
@@ -1436,12 +1430,10 @@ bool ConstraintGenerator::visit(CaseStatementAST *ast)
 bool ConstraintGenerator::visit(DoStatementAST *ast)
 {
     DEBUG_VISIT(DoStatementAST);
+    OBSERVE(DoStatementAST);
 
-    maybeFollowStmt();
-    convertBoolExpression(ast->expression);
-
-    if (ast->statement)
-        visitStatement(ast->statement);
+    treatAsBool(ast->expression);
+    visitStatement(ast->statement);
 
     return false;
 }
@@ -1449,60 +1441,37 @@ bool ConstraintGenerator::visit(DoStatementAST *ast)
 bool ConstraintGenerator::visit(WhileStatementAST *ast)
 {
     DEBUG_VISIT(WhileStatementAST);
+    OBSERVE(WhileStatementAST);
 
-    maybeFollowStmt();
-    convertBoolExpression(ast->condition);
-
-    if (ast->statement)
-        visitStatement(ast->statement);
+    Scope* prevScope = switchScope(ast->symbol);
+    treatAsBool(ast->condition);
+    visitStatement(ast->statement);
+    switchScope(prevScope);
 
     return false;
-}
-
-void ConstraintGenerator::maybeFollowStmt()
-{
-    if (seenStmt_)
-        writer_->writeAnd(true);
-    seenStmt_ = true;
 }
 
 bool ConstraintGenerator::visit(ForStatementAST *ast)
 {
     DEBUG_VISIT(ForStatementAST);
+    OBSERVE(ForStatementAST);
 
-    // Declaration within a for statement in only available C99 onwards.
-    if (ast->initializer
-            && ((ast->initializer->asExpressionStatement()
-                 && ast->initializer->asExpressionStatement()->expression)
-                || ast->initializer->asDeclarationStatement())) {
+    Scope* prevScope = switchScope(ast->symbol);
+    if (ast->initializer && ast->initializer->asDeclarationStatement())
+        visitDeclaration(ast->initializer->asDeclarationStatement()->declaration);
+    else
         visitStatement(ast->initializer);
-    }
 
-    if (ast->condition) {
-        maybeFollowStmt();
-        convertBoolExpression(ast->condition);
-    }
+    treatAsBool(ast->condition);
 
     if (ast->expression) {
-        maybeFollowStmt();
         const std::string& alpha = supply_.createTypeVar1();
-        writer_->writeNewTypeVar(alpha);
+        writer_->writeExists(alpha);
         collectExpression(alpha, ast->expression);
     }
 
-    if (ast->statement)
-        visitStatement(ast->statement);
-
-    if (ast->initializer->asDeclarationStatement()) {
-        maybeFollowStmt();
-        visitDeclaration(ast->initializer->asDeclarationStatement()->declaration);
-        if (!preprocess_) {
-            PSYCHE_ASSERT(!pendingEquivs_.empty(), return false, "expected for's declaration");
-            const EquivPair& equiv = pendingEquivs_.top();
-            writer_->writeEquivRelation(equiv.first, equiv.second);
-            pendingEquivs_.pop();
-        }
-    }
+    visitStatement(ast->statement);
+    switchScope(prevScope);
 
     return false;
 }

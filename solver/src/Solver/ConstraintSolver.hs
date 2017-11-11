@@ -1,4 +1,4 @@
--- Copyright (c) 2016 Rodrigo Ribeiro (rodrigo@decsi.ufop.br)
+-- Copyright (c) 2016 Rodrigo RiAbeiro (rodrigo@decsi.ufop.br)
 --                    Leandro T. C. Melo (ltcmelo@gmail.com)
 --                    Marcus Rodrigues (demaroar@gmail.com)
 --
@@ -26,200 +26,326 @@ import qualified Data.List as List
 import Data.Maybe (isJust, fromJust)
 
 import Data.Constraints
-import Data.Type
 import Data.BuiltIn
+import Data.CLang
+import Data.Type
 
 import Control.Monad hiding (void)
 import Control.Monad.Trans
 import Control.Monad.State hiding (void)
 import Control.Monad.Except hiding (void)
 
+import Solver.Decaying
+import Solver.ContextAssemble
+import Solver.ConversionRules
+import Solver.Retypeable
 import Solver.SolverMonad
 import Solver.Unification
-import Solver.ConversionRules
-import Solver.Decaying
+
 import Utils.Pretty
 
 import Debug.Trace
 
 
-solver :: Constraint -> IO (Either String (TyCtx, VarCtx))
-solver c = runSolverM (solve c) ((length $ fv c) + 1)
+solver :: Constraint -> CLang -> Bool -> IO (Either String (TyCtx, VarCtx))
+solver c cl ml = runSolverM (solve c cl ml) (((maxVarId 0 c) + 1), 1)
 
-solve :: Constraint -> SolverM (TyCtx, VarCtx)
-solve c = do
-    -- Expand typedefs.
-    (tc0,c') <- stage1 (TyCtx $ Map.union builtinTyCtx stdTyCtx) c
 
-    -- Expand variable types and create missing variables.
-    (vcx,c'') <- stage2 (VarCtx $ Map.union builtinVarCtx stdVarCtx) c'
+-- | Discover the maximum type variable id.
+maxVarId :: Int -> Constraint -> Int
+maxVarId k (Def _ _ c) = maxVarId k c
+maxVarId k (Scope c) = maxVarId k c
+maxVarId k (c :&: c') = max (maxVarId k c) (maxVarId k c')
+maxVarId k (Exists (Name n) c) = maxVarId (max k (varId n)) c
+maxVarId k _ = k
 
-    -- Split constraints into equality, inequality, and field acess.
-    let (eqs, iqs, fds) = stage3 c''
 
-    -- Run plain unification on equalities and apply substitutions on the inequalities. This will
-    -- instantiate types and make it possible to sort the inequalities according to a desired
-    -- directionality criteria. Therefore, once directional unification is run on the inequalities
-    -- type variables are bound in a proper order, that corresponds to a subtyping order.
-    s <- punifyList eqs
-    let iqs' = apply s iqs
-        (iq1, iq2, iq3, iq4) = dsort iqs'
-        iqs'' = iq1 ++ iq2 ++ iq3
-    s' <- dunifyList iqs''
-    let s'' = s' @@ s
+-- | Solve constraints.
+solve :: Constraint -> CLang -> Bool -> SolverM (TyCtx, VarCtx)
+solve c cl ml = do
+  let
+    -- Populate builtin and standard library types and values.
+    tcx = TyCtx $ (builtinTypes cl) `Map.union` (if ml then (stdTypes cl) else Map.empty)
+    vcx = VarCtx $ (builtinValues cl) `Map.union` (if ml then (stdValues cl) else Map.empty)
 
-    -- Assemble records.
-    (tcx1, vcx1, s''', cnt) <- stage4 tc0 vcx fds s''
+  -- Populate typing context and incorporate typedefs.
+  (tcx0,c') <- stage1 tcx c
 
-    -- Unify against the top type: void*.
-    let vqs = apply s''' iq4
-    ss <- dunifyList vqs
-    let ss' = ss @@ s'''
-        tcx11 = TyCtx $ Map.map (\(t,b) -> (apply ss' t, b)) (tyctx tcx1)
-        vcx11 = VarCtx $ Map.map (\varInfo -> apply ss' varInfo) (varctx vcx1)
+  -- Populate value context, create missing variables, generalize types.
+  (vcx0,c'') <- stage2 vcx c'
 
-     -- Orphanification.
-    (tcx1', vcx1') <- stage5 tcx11 vcx11 cnt
+  {--liftIO (print $ text "c\n" <+> pprint c)
+  liftIO (print $ text "tcx0\n" <+> pprint (TyCtx $ cleanTypes C99 (tyctx tcx0)))
+  liftIO (print $ text "c'\n" <+> pprint c')
+  liftIO (print $ text "vcx0\n" <+> pprint (VarCtx $ cleanValues C99 (varctx vcx0)))--}
 
-    -- Decay function pointers.
-    (tcx2, vcx2) <- decay tcx1' vcx1'
+  -- Split constraints into equivalence, inequality, and field acess.
+  let (eqs, iqs, fds) = stage3 c''
 
+  -- Move function constraints to last positions, so we get more instantiated types to match
+  -- variadic functions.
+  let moveFun c@((FunTy _ _) :=: _) acc = acc ++ [c]
+      moveFun c@(_ :=: (FunTy _ _)) acc = acc ++ [c]
+      moveFun c acc = c:acc
+      eqs' = List.foldr moveFun [] eqs
+
+  -- Run plain unification on equalities and apply the substitutions on the inequalities,
+  -- allowing us to sort them in a const-aware manner later.
+  s0 <- punifyList eqs'
+
+  (s, ineqs) <- makeEquivFromSymIneq s0 iqs
+
+  -- Identity inconsistent pointer conversions, where the only solution is to bind a type
+  -- variable to void*.
+  let
+    iqs'' = sortBySubTy ineqs
+    sortBySubTy iq = List.sortBy subPred iq
+    subPred (_ :>: t) (_ :>: t') = compare (nameOf t) (nameOf t')
+  vs <- detectVoidPtr iqs''
+
+  -- We want a binding order such that it weakens type qualifiers when possible, but
+  -- enforces it when necessary. Therefore, the sorting prior to unifying inequalities.
+  let
+    vs' = vs @@ s
+    iqs_'' = apply vs' iqs''
+    (iq1, iq2, iq3, iq4, iq5) = dsort iqs_''
+    iqs''' = iq1 ++ iq2 ++ iq3
+  s' <- dunifyList iqs'''
+  let s'' = s' @@ vs'
+
+  -- Assemble records.
+  (tcx1, vcx1, s''') <- stage4 tcx0 vcx0 fds s''
+
+  let cc' = apply s''' c'
+  vcx1' <- untypeVariadics cc' s''' vcx1
+
+  -- Translate structural representation to a nominative one.
+  (tcx2, vcx2) <- stage5 tcx1 vcx1' s'''
+
+  -- Unify against void* and scalar types.
+  let vqs = apply s''' (iq4 ++ iq5)
+  ss <- dunifyList vqs
+  let
+    ss' = ss @@ s'''
+    tcx3 = TyCtx $ Map.map (\(t,b) -> (apply ss' t, b)) (tyctx tcx2)
+    vcx3 = VarCtx $ Map.map (\varInfo -> apply ss' varInfo) (varctx vcx2)
+
+  -- Orphanize type variables that remain.
+  let  (tcx4, vcx4) = stage6 tcx3 vcx3
+
+  -- Decay function pointers.
+  (tcx5, vcx5) <- decay tcx4 vcx4
+
+  let
     -- Remove builtins and standard library components.
-    let
-        tcx2_ = undefTys (tyctx tcx2) Map.\\ builtinTyCtx Map.\\ stdTyCtx
-        vcx2_ = undefVars (varctx vcx2) Map.\\ builtinVarCtx Map.\\ stdVarCtx
+    tcx_ = undefTys (tyctx tcx5)
+             Map.\\ (builtinTypes cl)
+             Map.\\ (if ml then (stdTypes cl) else Map.empty)
+    vcx_ = undefVars (varctx vcx5)
+             Map.\\ (builtinValues cl)
+             Map.\\ (if ml then (stdValues cl) else Map.empty)
 
-    return (TyCtx tcx2_, VarCtx vcx2_)
+    -- Remove anonymous types, their definitions are always in the program. Otherwise, we would
+    -- have given them names.
+    nonAnon _ ((RecTy _ n), b)
+      | ensurePlain n == emptyName = False
+      | otherwise = True
+    nonAnon _ _ = True
+    tcx_' = Map.filterWithKey nonAnon tcx_
+
+  return (TyCtx tcx_', VarCtx vcx_)
 
 
---cleanv c = VarCtx $  (varctx c) Map.\\ builtinVarCtx Map.\\ stdVarCtx
---cleant c = TyCtx $  (tyctx c) Map.\\ builtinTyCtx Map.\\ stdTyCtx
+instance Pretty ValSym where
+  pprint =
+   foo . bar
+    where
+   bar sym = (valty sym, static sym)
+   foo (t, st) = pprint t <+> text (show st)
+--}
 
+
+-- | Populate the typing context, replacing "duplicate" types so that a single instance of
+-- each one of them exists.
 stage1 :: TyCtx -> Constraint -> SolverM (TyCtx, Constraint)
 stage1 tctx (t :=: t') =
-    return (tctx, (replaceTy tctx t) :=: (replaceTy tctx t'))
+  return (tctx, (findCanonical tctx t) :=: (findCanonical tctx t'))
 stage1 tctx (t :>: t') =
-    return (tctx, (replaceTy tctx t) :>: (replaceTy tctx t'))
+  return (tctx, (findCanonical tctx t) :>: (findCanonical tctx t'))
 stage1 tctx (n :<-: t) =
-    return (tctx, n :<-: (replaceTy tctx t))
+  return (tctx, n :<-: (findCanonical tctx t))
 stage1 tctx (Has n (Field n' t)) =
-    return (tctx, Has n (Field n' (replaceTy tctx t)))
-stage1 tctx (TypeDef t t') = defineTypeDef t t' tctx
+  return (tctx, Has n (Field n' (findCanonical tctx t)))
+stage1 tctx (TypeDef t t') = createEquiv t t' tctx
 stage1 tctx (c :&: c') = do
-    (tcx1, c1) <- stage1 tctx c
-    (tcx2, c1') <- stage1 tcx1 c'
-    return (tcx2, c1 :&: c1')
+  (tcx1, c1) <- stage1 tctx c
+  (tcx2, c1') <- stage1 tcx1 c'
+  return (tcx2, c1 :&: c1')
 stage1 tctx (Exists n c) = do
-    v <- fresh
-    stage1 tctx (apply (n +-> v) c)
+  v <- fresh
+  stage1 tctx (apply (n +-> v) c)
 stage1 tctx (Def n t c) = do
-    (tcx, c')  <- stage1 tctx c
-    return (tcx, Def n (replaceTy tctx t) c')
+  (tcx, c') <- stage1 tctx c
+  return (tcx, Def n (findCanonical tctx t) c')
+stage1 tctx (Scope c) = do
+  (tcx, c') <- stage1 tctx c
+  return (tcx, Scope c')
 stage1 tctx c@(ReadOnly _) = return (tctx, c)
+stage1 tctx c@(Static _) = return (tctx, c)
 stage1 tctx Truth = return (tctx, Truth)
 
-defineTypeDef :: Ty -> Ty -> TyCtx -> SolverM (TyCtx, Constraint)
-defineTypeDef (Pointer t) (Pointer t') tctx = do
-    (tcx,c) <- defineTypeDef t t' tctx
-    return (tcx, (t :=: t') :&: c)
-defineTypeDef t@(Pointer l) t'@(TyVar v) tctx = do
-    v' <- fresh
-    (tcx, c) <- defineTypeDef l v' tctx
-    return (tcx, (t' :=: (Pointer v')) :&: c)
-defineTypeDef (QualTy t) (QualTy t') tctx = do
-    (tcx,c) <- defineTypeDef t t' tctx
-    return (tcx, (t :=: t') :&: c)
-defineTypeDef t@(QualTy l) t'@(TyVar v) tctx = do
-     v' <- fresh
-     (tcx, c) <- defineTypeDef l v' tctx
-     return (tcx, (t' :=: (QualTy v')) :&: c)
-defineTypeDef t@(EnumTy n) t'@(TyVar v) tctx = do
-    let
-      tctx' = TyCtx $ maybe (Map.insert n (EnumTy n, False) (tyctx tctx))
+
+-- | Find the canonical instance of a type.
+findCanonical :: TyCtx -> Ty -> Ty
+findCanonical _ t@(VarTy _) = t
+findCanonical tctx t@(NamedTy n) = maybe t fst (Map.lookup n (tyctx tctx))
+findCanonical tctx (FunTy t ts) = FunTy (findCanonical tctx t) (map (findCanonical tctx) ts)
+findCanonical tctx (RecTy fs n) = RecTy (map (\f -> f{ty = findCanonical tctx (ty f)}) fs) n
+findCanonical tctx (SumTy fs n) = SumTy (map (\f -> f{ty = findCanonical tctx (ty f)}) fs) n
+findCanonical tctx (PtrTy t) = PtrTy (findCanonical tctx t)
+findCanonical tctx (QualTy t q) = QualTy (findCanonical tctx t) q
+findCanonical _ t@(AnyTy) = t
+findCanonical _ t@(EnumTy _) = Data.BuiltIn.int -- We treat enumerations as plain integer.
+
+
+-- | Create type equivalences.
+createEquiv :: Ty -> Ty -> TyCtx -> SolverM (TyCtx, Constraint)
+createEquiv (PtrTy t) (PtrTy t') tctx = do
+  (tcx,c) <- createEquiv t t' tctx
+  return (tcx, (t :=: t') :&: c)
+createEquiv t@(PtrTy l) t'@(VarTy v) tctx = do
+  v' <- fresh
+  (tcx, c) <- createEquiv l v' tctx
+  return (tcx, (t' :=: (PtrTy v')) :&: c)
+createEquiv (QualTy t _) (QualTy t' _) tctx = do
+  (tcx,c) <- createEquiv t t' tctx
+  return (tcx, (t :=: t') :&: c)
+createEquiv t@(QualTy l q) t'@(VarTy v) tctx = do
+   v' <- fresh
+   (tcx, c) <- createEquiv l v' tctx
+   return (tcx, ((QualTy v' q) :=: t') :&: c)
+createEquiv t@(EnumTy n) t'@(VarTy v) tctx = do
+  let tctx' = TyCtx $ maybe (Map.insert n (EnumTy n, False) (tyctx tctx))
                             (const (tyctx tctx))
                             (Map.lookup n (tyctx tctx))
-    return (tctx', Truth)
-defineTypeDef t@(EnumTy n) t'@(EnumTy _) tctx = error "TODO: Implement me."
-defineTypeDef t t' tctx = do
-    let
-      actualTyDef tn td =
-        case td of
-             Struct _ n -> ((TyCon $ ensureElabStructName n), True)
-             EnumTy n -> ((TyCon $ ensureElabEnumName n), True)
-             Pointer td' -> (Pointer td'', b)
-               where (td'', b) = actualTyDef tn td'
-             QualTy td' -> (QualTy td'', b)
-               where (td'', b) = actualTyDef tn td'
-             tc@(TyCon n) ->
-               case Map.lookup n (tyctx tctx) of
-                    Nothing -> (tc, True)
-                    Just tinfo -> tinfo
-             _ -> (td, False)
-      tctx' = TyCtx $ maybe (Map.insert (nameOf t) (actualTyDef t t') (tyctx tctx))
-                            (const (tyctx tctx))
-                            (Map.lookup (nameOf t) (tyctx tctx))
-    return (tctx' , Truth)
-
-replaceTy :: TyCtx -> Ty -> Ty
-replaceTy tctx t@(TyCon n) = maybe t fst (Map.lookup n (tyctx tctx))
-replaceTy tctx t@(TyVar _) = t
-replaceTy tctx (FunTy t ts) = FunTy (replaceTy tctx t) (map (replaceTy tctx) ts)
-replaceTy tctx (QualTy t) = QualTy (replaceTy tctx t)
-replaceTy tctx (Pointer t) = Pointer (replaceTy tctx t)
-replaceTy tctx (Struct fs n) =
-    Struct (map (\f -> f{ty = replaceTy tctx (ty f)}) fs) n
-replaceTy tctx t@(EnumTy _) = Data.BuiltIn.int
+  return (tctx', Truth)
+createEquiv t t'@(VarTy _) tcx = do
+  let
+    tctx' = TyCtx $ maybe (Map.insert (nameOf t) (flattenDecl tcx t t') (tyctx tcx))
+                          (const (tyctx tcx))
+                          (Map.lookup (nameOf t) (tyctx tcx))
+  return (tctx' , Truth)
+createEquiv t t' tcx = do -- Prefer a concrete type (when the definition only later appeared).
+  let
+    redefine _ = Map.insert (nameOf t) (t', True) (tyctx tcx)
+    tctx' = TyCtx $ maybe (Map.insert (nameOf t) (flattenDecl tcx t t') (tyctx tcx))
+                          (redefine)
+                          (Map.lookup (nameOf t) (tyctx tcx))
+  return (tctx' , Truth)
 
 
+-- | Flatten a type declaration, discarding the definition part.
+flattenDecl :: TyCtx -> Ty -> Ty -> (Ty, Bool)
+  -- The declaration of a function is sufficient to make it "declared", even though if
+  -- its definition might be missing. No matter what is its equivalent part.
+flattenDecl _ (FunTy _ _) t = (t, True)
+flattenDecl tctx _ t@(NamedTy n) = maybe (t, True) id (Map.lookup n (tyctx tctx))
+flattenDecl _ _ t@(VarTy _) = (t, False)
+flattenDecl tctx t' (QualTy t q) =
+  (QualTy t'' q, b)
+ where
+  (t'', b) = flattenDecl tctx t' t
+flattenDecl tctx t' (PtrTy t) =
+  (PtrTy t'', b)
+ where
+  (t'', b) = flattenDecl tctx t' t
+flattenDecl _ _ t@(FunTy _ _) = (t, False)
+flattenDecl _ _ (RecTy _ n) = (NamedTy n, True)
+flattenDecl _ _ (SumTy _ n) = (NamedTy n, True)
+flattenDecl _ _ t = (t, False)
+
+
+-- | Collect variable's type.
 stage2 :: VarCtx -> Constraint -> SolverM (VarCtx, Constraint)
 stage2 vtx (n :<-: t@(FunTy rt pts)) =
     case Map.lookup n (varctx vtx) of
         Just info ->
-            case varty info of
+            case valty info of
                 FunTy rt' pts' -> do
                     let pcs = zipWith (\t t' -> (t' :>: t)) pts pts'
                         pcs' = foldr (\c acc -> c :&: acc) Truth pcs
-                        rtc = rt' :>: rt
+                        rtc = rt :>: rt'
                     return (vtx, pcs' :&: rtc)
-                -- FIXME: Verify scoping.
-                t' -> return (vtx, t' :=: t) -- error (show $ pprint t)
+                t' -> return (vtx, t' :=: t)
         Nothing -> do
             v <- fresh
-            return ( VarCtx $ Map.insert n (VarInfo v False False) (varctx vtx)
+            return ( VarCtx $ Map.insert n (ValSym v False False False) (varctx vtx)
                     , v :=: t )
 stage2 vtx (n :<-: t) =
-    case Map.lookup n (varctx vtx) of
-        Just info -> return (vtx, varty info :=: t)
-        Nothing -> do
-            v <- fresh
-            return ( VarCtx $ Map.insert n (VarInfo v False False) (varctx vtx)
-                   , v :=: t )
-stage2 vtx (Def n t c) =
-    stage2 (VarCtx $ Map.insert n (VarInfo t True False) (varctx vtx)) c
+  case Map.lookup n (varctx vtx) of
+    Just info -> return (vtx, valty info :=: t)
+    Nothing -> do
+      v <- fresh
+      return (VarCtx $ Map.insert n (ValSym v False False False) (varctx vtx), v :=: t)
+stage2 vtx (Def n t c) = do
+  -- Functions might have their definition in the program but not their declaration. A function
+  -- call prior to the definition will be inserted into the environment through an ascription
+  -- constraint. Therefore, if when the definition is later on discovered, we need to preserve
+  -- the symbol properties and "update" its type, possibly producing another constraint.
+  let
+    matchFunc t@(FunTy _ _) t' c = (t :=: t') :&: c
+    matchFunc _ _ c = c
+    replaceOrInsert t decl st  = VarCtx $ Map.insert n (ValSym t True decl st) (varctx vtx)
+    (vtx', c') = case Map.lookup n (varctx vtx) of
+             Just sym -> (replaceOrInsert t (readOnly sym) (static sym), matchFunc t (valty sym) c)
+             Nothing -> (replaceOrInsert t False False, c)
+  stage2 vtx' c'
+stage2 vtx (Scope c) = do
+  (vtx', c') <- stage2 vtx c
+  let
+    updateSym acc n ce = Map.adjust (\(ValSym t dc _ st) -> ValSym t dc ce st) n acc
+    replaceOrNot n sym@(ValSym t d ce _) acc
+      | not d = if Map.member n acc then updateSym acc n ce else Map.insert n sym acc
+      | otherwise = acc
+    vtx'' = VarCtx $ Map.foldrWithKey replaceOrNot (varctx vtx) (varctx vtx')
+  return (vtx'', c')
 stage2 vtx (c :&: c') = do
-    (vtx1, c1) <- stage2 vtx c
-    (vtx2, c2) <- stage2 vtx1 c'
-    let
-        preferQual (VarInfo lt@(QualTy _) b ro) _ = VarInfo lt b ro
-        preferQual _ (VarInfo rt@(QualTy _) b ro) = VarInfo rt b ro
-        preferQual l r = l
-    return ( VarCtx $ Map.unionWith preferQual (varctx vtx1) (varctx vtx2)
+  (vtx1, c1) <- stage2 vtx c
+  (vtx2, c2) <- stage2 vtx1 c'
+  let
+    -- Pick the symbol in which attributes are "enforced" by what's available in the program.
+    choose (ValSym t@(QualTy _ _) dc ce st) (ValSym _ dc' ce' st') =
+      ValSym t (dc && dc') (ce || ce') (st || st')
+    choose (ValSym _ dc ce st) (ValSym t@(QualTy _ _) dc' ce' st') =
+      ValSym t (dc && dc') (ce || ce') (st || st')
+    -- A function can be defined, but not declared. We wanna pick the type of the one defined,
+    -- available in the program. So we don't risk a mismatching signature due to modulo-
+    -- conversion inferred type.
+    choose (ValSym t dc ce st) (ValSym t' dc' ce' st')
+      | dc = ValSym t (dc && dc') (ce || ce') (st || st')
+      | otherwise = ValSym t' (dc && dc') (ce || ce') (st || st')
+  return ( VarCtx $ Map.unionWith choose (varctx vtx1) (varctx vtx2)
            , c1 :&: c2 )
 stage2 vtx c@(Has _ _) = return (vtx, c)
 stage2 vtx c@(_ :=: _) = return (vtx, c)
 stage2 vtx c@(_ :>: _) = return (vtx, c)
 stage2 vtx (ReadOnly n) =
-    case Map.lookup n (varctx vtx) of
-        Nothing -> error "const can only be applied on known values"
-        Just info -> do
-             v <- fresh
-             return ( VarCtx $ Map.insert n
-                               (VarInfo (QualTy (varty info)) (declared info) True)
-                               (varctx vtx)
-                    , Truth)
+  case Map.lookup n (varctx vtx) of
+    Nothing -> error "constexpr can only be applied on known values"
+    Just info -> return
+      (VarCtx $ Map.insert n
+                (ValSym (QualTy (valty info) Const) (declared info) True (static info))
+                (varctx vtx), Truth)
+stage2 vtx c@(Static n) =
+  case Map.lookup n (varctx vtx) of
+    Nothing -> error "static can only be applied on known values"
+    Just info -> return (VarCtx $ Map.insert n
+                                  (ValSym (valty info) (declared info) (readOnly info) True)
+                                  (varctx vtx), Truth)
 stage2 vtx Truth = return (vtx, Truth)
 
 
+-- | Split constraints into equivalences, inequalities, and field access.
 stage3 :: Constraint -> ([Constraint], [Constraint], [Constraint])
 stage3 (c :&: c') =
     (eq ++ eq', iq ++ iq', fs ++ fs')
@@ -232,182 +358,268 @@ stage3 c@(_ :>: _) = ([], [c], [])
 stage3 Truth = ([], [], [])
 
 
-dsort :: [Constraint] -> ([Constraint], [Constraint], [Constraint], [Constraint])
-dsort [] = ([], [], [], [])
+-- | Convert symmetric inequalities such as alphaX :>: alphaY and alphaY > alphaX into an
+--   equivalence alphaX = alphaY, reapplying substitutions in the end.
+makeEquivFromSymIneq :: Subst -> [Constraint] -> SolverM (Subst, [Constraint])
+makeEquivFromSymIneq s cstr = do
+  let
+    ineqs = apply s cstr
+    lookupTable = List.foldr (\(t :>: t') acc -> Set.insert (t' :>: t) acc) Set.empty ineqs
+    ineqs' = List.filter (\x -> if Set.member x lookupTable then False else True) ineqs
+    equivs = ineqs List.\\ ineqs'
+    equivs' = List.foldr (\(t :>: t') acc -> (t :=: t'):acc) [] equivs
+
+  s' <-punifyList equivs'
+  let ineqs'' = apply s ineqs'
+      s'' = s' @@ s
+  return (s'', ineqs'')
+
+
+-- | Detect and instantiate void*.
+detectVoidPtr :: [Constraint] -> SolverM Subst
+detectVoidPtr [] = return nullSubst
+detectVoidPtr [(_ :>: _)] = return nullSubst
+detectVoidPtr ((t1 :>: t1'):c@(t2 :>: t2'):xs) = do
+  let
+    check t tn@(VarTy n) t' tn'@(VarTy n')
+      | t /= tn
+        && t' /= tn'
+        && n == n'
+        && (dropTopQual Const t) /= (dropTopQual Const t') = return (n +-> (PtrTy void))
+      | t /= tn
+        && t' /= tn'
+        && n == n'
+        && (dropTopQual Volatile t) /= (dropTopQual Volatile t') = return (n +-> (PtrTy void))
+      | otherwise = return nullSubst
+    check _ _ _ _  = return nullSubst
+  s <- check t1 t1' t2 t2'
+  s' <- detectVoidPtr ((apply s c):(apply s xs))
+  return (s' @@ s)
+
+
+-- | Sort constraint relations as according to our modeled subtyping relation.
+dsort :: [Constraint] -> ([Constraint], [Constraint], [Constraint], [Constraint], [Constraint])
+dsort [] = ([], [], [], [], [])
 dsort (x:xs) =
-    (eq1 ++ eq1', eq2 ++ eq2', eq3 ++ eq3', eq4 ++ eq4')
-  where
-    (eq1, eq2, eq3, eq4) = dsort' x
-    (eq1', eq2', eq3', eq4') = dsort xs
+  (eq1 ++ eq1', eq2 ++ eq2', eq3 ++ eq3', eq4 ++ eq4', eq5 ++ eq5')
+ where
+  (eq1, eq2, eq3, eq4, eq5) = dsort' x
+  (eq1', eq2', eq3', eq4', eq5') = dsort xs
 
-dsort' :: Constraint -> ([Constraint], [Constraint], [Constraint], [Constraint])
-dsort' c@(_ :>: (Pointer (QualTy t)))
-    | isTyVarDep t = ([], [], [c], [])
-    | t == Data.BuiltIn.void = ([], [], [], [c])
-    | otherwise = ([c], [], [], [])
-dsort' c@(_ :>: (Pointer t))
-    | t == Data.BuiltIn.void = ([], [], [], [c])
-    | otherwise =  ([], [], [c], [])
-dsort' c@((Pointer t) :>: _)
-    | isTyVarDep t = ([], [], [c], [])
-    | t == Data.BuiltIn.void = ([], [], [], [c])
-    | otherwise = case t of
-        QualTy _ -> ([], [], [c], [])
-        _ -> ([], [c], [], [])
-dsort' c = ([], [], [c], [])
+dsort' :: Constraint -> ([Constraint], [Constraint], [Constraint], [Constraint], [Constraint])
+dsort' c@(_ :>: (PtrTy (QualTy t _)))
+  | hasVarDep t = ([], [], [c], [], [])
+  | t == Data.BuiltIn.void = ([], [], [], [c], [])
+  | otherwise = ([c], [], [], [], [])
+dsort' c@(_ :>: (PtrTy t))
+  | t == Data.BuiltIn.void = ([], [], [], [c], [])
+  | otherwise =  ([], [], [c], [], [])
+dsort' c@((PtrTy t) :>: _)
+  | hasVarDep t = ([], [], [c], [], [])
+  | t == Data.BuiltIn.void = ([], [], [], [c], [])
+  | t == Data.BuiltIn.scalar_t__ = ([], [], [], [], [c])
+  | otherwise = case t of { QualTy _ _ -> ([], [], [c], [], []); _ -> ([], [c], [], [], []) }
+dsort' c@(t :>: t')
+  | t' == Data.BuiltIn.scalar_t__ = ([], [], [], [], [c])
+  | otherwise = ([], [], [c], [], [])
 
 
-stage4 :: TyCtx -> VarCtx -> [Constraint] -> Subst -> SolverM (TyCtx, VarCtx, Subst, Int)
+-- | Assemble records by unified their fields. After this stage, all typing information
+-- (including composite types) is complete. However, as in a structural type system.
+stage4 :: TyCtx -> VarCtx -> [Constraint] -> Subst -> SolverM (TyCtx, VarCtx, Subst)
 stage4 tcx vcx fs s = do
-    -- We must sort fields by struct and by name.
-    let
-        fsubs = apply s fs
-        tyAndFieldPred (Has t (Field fn _)) (Has t' (Field fn' _))
-            | tn == tn' = compare fn fn'
-            | otherwise = compare tn tn'
-          where
-            tn = (nameOf t)
-            tn' = (nameOf t')
-        sortedByTyAndFields = List.sortBy tyAndFieldPred fsubs
-    s1 <- punifyFields sortedByTyAndFields
+  -- To unify fields we need to sort them first (fields beloging to the same record will be
+  -- adjacent one to the other). Each unification might discover additional relations:
+  -- nested structs. So we need do this recursively, until no substitutions are generated.
+  let
+    discover fs s = do
+      let sorted = sortFields fs s
+      s' <- punifyFields sorted
+      if s' /= nullSubst then discover sorted (s' @@ s) else return s
+  s1 <- discover fs s
 
+  let
     -- Build a map of fields using as key a type name.
-    let
-        s2 = s1 @@ s
-        go (Has n t) ac = maybe (Map.insert (nameOf n) [apply s2 t] ac)
-                                (\ts -> Map.insert (nameOf n) ((apply s2 t):ts) ac)
-                                (Map.lookup (nameOf n) ac)
-        fieldMap = foldr go Map.empty (apply s2 fs)
+    s2 = s1 @@ s
+    go (Has n t) ac = maybe (Map.insert (nameOf n) [apply s2 t] ac)
+                            (\ts -> Map.insert (nameOf n) ((apply s2 t):ts) ac)
+                            (Map.lookup (nameOf n) ac)
+    fieldMap = foldr go Map.empty (apply s2 fs)
 
-        -- Fields might be used several times, but we only need one of each.
-        orderByConTy [] = []
-        orderByConTy (x:xs)
-             | isVar (nameOf (ty x)) = (orderByConTy xs) ++ [x]
-             | otherwise = x:(orderByConTy xs)
-        fieldMapOrd = foldr (\(n, fs) acc -> (n, orderByConTy fs):acc) [] (Map.toList fieldMap)
-        mergeFields (n, fs) acc = (n, List.nubBy (\f1 f2 -> (name f1) == (name f2)) fs): acc
-        fieldMap' = foldr mergeFields [] fieldMapOrd
-        fieldMap'' = Map.fromList fieldMap'
-        s' = Subst $ Map.mapWithKey (\v fs -> Struct fs v) fieldMap''
-        s'' = s' @@ s2
+    -- Fields might be used several times, but we only need one of each.
+    orderByConTy [] = []
+    orderByConTy (x:xs)
+      | isVar (nameOf (ty x)) = (orderByConTy xs) ++ [x]
+      | otherwise = x:(orderByConTy xs)
+    fieldMapOrd = foldr (\(n, fs) acc -> (n, orderByConTy fs):acc) [] (Map.toList fieldMap)
+    mergeFields (n, fs) acc = (n, List.nubBy (\f1 f2 -> (name f1) == (name f2)) fs): acc
+    fieldMap' = foldr mergeFields [] fieldMapOrd
+    fieldMap'' = Map.fromList fieldMap'
 
-        -- Apply substitutions.
-        tcx_ = Map.map (\(t,b) -> (apply s'' t, b)) (tyctx tcx)
-        vcx_ = Map.map (\varInfo -> apply s'' varInfo) (varctx vcx)
+    -- Fields are always assembled into a struct, which is the default behavior associated
+    -- with field access constraints. It's impossible to tell whether such fields would
+    -- have originated from a union, unless the actuall declaration of the type is inside
+    -- the program or the variable has been declared through an elaborated type specifier
+    -- using the the union keyword. Nevertheless, at this stage we're concerned about the
+    -- structural representation of composite types. Later, we handle the cases in which
+    -- such a composite type has actually been declared as a union.
+    s' = Subst $ Map.mapWithKey (\v fs -> RecTy fs v) fieldMap''
+    s'' = s' @@ s2
 
-        -- We now need to combine type variables which are of struct types to
-        -- their corresponding structs. If the given structs are declared in the
-        -- program, their names are supplied to the type constructor. Otherwise,
-        -- we create fake names for them. TODO: Refactor this little mess...
-        acc = (0, Map.empty, Map.empty)
-        keepType acc k t = (acc, t)
-        makeElabStruct acc@(cnt, nonOrphan, orphan) n v fs =
-            ( (cnt, Map.insert v t' nonOrphan, orphan)
-            , apply (v +-> t') $ Struct fs n')
-          where
-            n' = ensureElabStructName n
-            t' = TyCon n'
-        (pending, tcx_') = Map.mapAccumWithKey (retype keepType makeElabStruct) acc tcx_
+    -- Apply substitutions.
+    tcx_ = Map.map (\(t,b) -> (apply s'' t, b)) (tyctx tcx)
+    vcx_ = Map.map (\varInfo -> apply s'' varInfo) (varctx vcx)
 
-        -- Fake structs
-        makeFakeStruct acc@(cnt, nonOrphan, orphan) _ v fs' =
-            ( (cnt + 1, Map.insert v t' nonOrphan, orphan)
-            , apply (v +-> t') $ Struct fs' fakeName)
-          where
-            t' = TyCon fakeName
-            fakeName = ensureElabStructName (Name ("T" ++ (show cnt)))
-
-        -- TODO: Store nested structs names in non-orphans map.
-        -- This has gotten messy... Need to refactor and split this stage.
-        structonly t@(Struct fs n) = Struct (map (applyCore2 s'' Set.empty) fs) n
-        structonly t@(Pointer t') = Pointer (structonly t')
-        structonly t = t
-        structonly' (t, b) = (structonly t, b)
-        tcx_2 = Map.map structonly' tcx_'
-        structonly'' (VarInfo t b ro) = (VarInfo (structonly t) b ro)
-        vcx_2 = Map.map structonly'' vcx_'
-
-        typefy acc@(_, nonOrphan, orphan) k t =
-            case Map.lookup (nameOf t) nonOrphan of
-                Just t' -> (acc, t')
-                Nothing -> (acc, t)
-        (pending1, vcx_') = Map.mapAccumWithKey
-            (retypeVar typefy makeFakeStruct) pending $ undefVars vcx_
-        (pending2, tcx_'') = Map.mapAccumWithKey
-            (retype typefy makeFakeStruct) pending1 tcx_2
-        (pending3, vcx_'') = Map.mapAccumWithKey
-            (retypeVar typefy makeFakeStruct) pending2 vcx_2
-
-        s''' = Subst $ ((\(_, x, _) -> x) pending3)
-        cnt = (\(x, _, _) -> x) pending3
-
-    return (TyCtx tcx_'', VarCtx vcx_'', s''', cnt)
+  return (TyCtx tcx_, VarCtx vcx_, s'')
 
 
-stage5 :: TyCtx -> VarCtx -> Int -> SolverM (TyCtx, VarCtx)
-stage5 tcx vcx cnt = do
-    let
-        -- Deal with orphans
-        orphanize f acc@(cnt, nonOrphan, orphan) k v =
-            case Map.lookup v orphan of
-                Just t -> (acc, t)
-                Nothing -> if isElabStructName k
-                    then ( (cnt, nonOrphan, Map.insert v (TyCon k) orphan)
-                         , Struct [ Field (Name "dummy") Data.BuiltIn.int ] k)
-                    else if isElabEnumName k
-                        then ( (cnt, nonOrphan, Map.insert v (TyCon k) orphan)
-                             , EnumTy k)
-                        else (acc, f v)
+untypeVariadics :: Constraint -> Subst -> VarCtx -> SolverM (VarCtx)
+untypeVariadics (n :<-: (FunTy _ pv)) s vcx =
+  return vcx'
+ where
+  vcx' = case Map.lookup n (varctx vcx) of
+    Nothing -> vcx -- When the name is typed as a function pointer.
+    Just (ValSym (FunTy r pt) d ce st) ->
+      let
+        params (t1:xs1) (t2:xs2)
+          | hasVarDep t2 = t1:(params xs1 xs2)
+          | hasVarDep t1 = t2:(params xs1 xs2)
+          | convertible (dropQual t1) t2 = t1:(params xs1 xs2)
+          | convertible t1 (dropQual t2) = t2:(params xs1 xs2)
+          | convertible (dropQual t1) (dropQual t2) = t1:(params xs1 xs2)
+          | otherwise = [AnyTy]
+        params (t:_) [] = [AnyTy]
+        params [] (t:_) = [AnyTy]
+        params [] [] = []
+        f = ValSym (FunTy r (params pt pv)) d ce st
+      in
+       if d then vcx else (VarCtx $ Map.insert n f (varctx vcx))
+    Just _ -> vcx
 
-        pending3 = (cnt, Map.empty, Map.empty)
-        (pending4, tcx_''') = Map.mapAccumWithKey
-            (retype (orphanize id) (error "error")) pending3 (tyctx tcx)
-        (pending5, vcx_''') = Map.mapAccumWithKey
-            (retypeVar (orphanize id) (error "error")) pending4 (varctx vcx)
-        (pending6, tcx_'''') = Map.mapAccumWithKey
-            (retype (orphanize (const orphan)) (error "error")) pending5 tcx_'''
-        (_, vcx_'''') = Map.mapAccumWithKey
-            (retypeVar (orphanize (const orphan)) (error "error")) pending6 vcx_'''
-
-    return (TyCtx tcx_'''', VarCtx vcx_'''')
+untypeVariadics (c1 :&: c2) s vcx = do
+  vcx1 <- untypeVariadics c1 s vcx
+  vcx2 <- untypeVariadics c2 s vcx1
+  return vcx2
+untypeVariadics (Def _ _ c) s vcx = untypeVariadics c s vcx
+untypeVariadics (Scope c) s vcx = untypeVariadics c s vcx
+untypeVariadics c s vcx = return vcx
 
 
-retype f g acc k (t, b) = (acc', (t', b))
-  where (acc', t') = combine acc k t f g
-retypeVar f g acc k (VarInfo t b ro) = (acc', VarInfo t' b ro)
-  where (acc', t') = combine acc k t f g
 
-combine acc@(_, nonOrphan, _) k t@(Struct fs v) f g
-    | isVar v = case Map.lookup v nonOrphan of
-                    Just t' -> (acc, t')
-                    Nothing -> g acc k v fs'
-    | otherwise = (acc', Struct fs' v)
-  where
-    (acc', fs') = combine' acc fs
-    combine' facc [] = (facc, [])
-    combine' facc (x@(Field fn ft):xs) =
-        (facc'', (Field fn ft'):xs')
-      where
-        (facc', ft') = combine facc fn ft f g
-        (facc'', xs') = combine' facc' xs
-combine acc k t@(FunTy rt ps) f g =
-    (acc'', FunTy rt' ps')
-  where
-    (acc', rt') = combine acc k rt f g
-    (acc'', ps') = combine' acc' ps
-    combine' pacc [] = (pacc, [])
-    combine' pacc (x:xs) =
-        (pacc'', x':xs')
-      where
-        (pacc', x') = combine pacc (nameOf x) x f g
-        (pacc'', xs') = combine' pacc' xs
-combine acc k t@(Pointer t') f g = (acc', Pointer t'')
-  where (acc', t'') = combine acc k t' f g
-combine acc k t@(QualTy t') f g = (acc', QualTy t'')
-  where (acc', t'') = combine acc k t' f g
-combine acc k t f g
-    | isVar t = f acc k t
-    | otherwise = (acc, t)
+-- | Bring structucally represented typing information into C world, by matching types with
+-- their declared names, eventually creating fake names for the undeclared types.
+stage5 :: TyCtx -> VarCtx -> Subst -> SolverM (TyCtx, VarCtx)
+stage5 tcx vcx s = do
+  let
+    -- We filter types declared through elaborated specifiers and work on them independently,
+    -- since it's illegal to typedef a type with an elaborated name. In addition, they are kept
+    -- in an index so we are able to identify their definitions so they can be matched.
+    tcxFlt_ = Map.filterWithKey (\k _ -> (not . isElab) k) (tyctx tcx)
+    elabIdx = Map.foldrWithKey (\k (t, _) acc ->
+      if isElab k then acc %% ((dropTopQualAny t) %-> k) else acc) nullIdx (tyctx tcx)
+    tcxFlt_' = Map.map (\(t, b) -> (compact elabIdx t , b)) tcxFlt_
+    vcxFlt_ = Map.map (\(ValSym t b ro st) -> ValSym (compact elabIdx t) b ro st) (varctx vcx)
+
+    tcxElab_ = (tyctx tcx) Map.\\ tcxFlt_'
+    tcxElab_' = Map.filter (not . snd) tcxElab_
+    tcxElab_'' = Map.mapWithKey (\k (t, b) -> (unalpha2 k t, b)) tcxElab_'
+    tcxElab_''' = Map.mapWithKey (\k (t, b) -> (keepElab k t, b)) tcxElab_''
+
+    -- Collect composite types so we can compact them. Througout this process we also
+    -- look into the substitutions because nested structs will only appear there.
+    nonElabCompo = Map.foldr (\(t, _) acc -> acc ++ collect t) [] tcxFlt_'
+    nonElabCompo' = Map.foldr (\(ValSym t _ _ _) acc -> acc ++ collect t) nonElabCompo vcxFlt_
+    allCompo = Map.foldr (\(t, _) acc -> (collect t) ++ acc) nonElabCompo' tcxElab_'
+    exclude = Set.fromList allCompo
+
+    -- We only check against structs because fields are always assembled as such. Cases
+    -- in which the composite type is actually union only happen if such elaborated type
+    -- specifier is present in the program. Then, those types are filtered out above.
+    consider [] cs h = (cs, h)
+    consider (t@(RecTy _ n):tx) cs h
+      | Set.member t h = consider tx cs h
+      | isVar n = ([t] ++ rest, h'')
+      | otherwise = consider tx cs h
+     where
+      h' = Set.insert t h
+      (rest, h'') = consider tx cs h'
+    consider _ _ _  = error "only struct types are collected"
+    (nonElabCompo'', _) = Map.foldr
+      (\t (xs, h) -> consider (collect t) xs h) (nonElabCompo', exclude) (subs s)
+
+  -- Assign names and keep record of the type/name relation through an index. Those are
+  -- inserted into the typing context as well.
+  idx <- foldM (\acc t -> makeName acc t) nullIdx nonElabCompo''
+
+  let
+    tcx_ = Map.map (\(t, b) -> (compact idx t, b)) tcxFlt_'
+    vcx_ = Map.map (\(ValSym t b ro st) -> ValSym (compact idx t) b ro st) vcxFlt_
+    tcx_' = Map.foldrWithKey (\t n acc -> Map.insert n (t, False) acc) tcx_ (ty2n idx)
+
+  -- "De-alphasize" top-level names so they match the ones we created.
+  tcx_'' <- mapM (\c -> unalpha c) tcx_'
+
+  let
+    -- Create an index to be used for de-alphasizing fields from composite types.
+    fullIdx = (ty2n idx) `Map.union` (ty2n elabIdx)
+    gon2n (RecTy _ n) n' acc = Map.insert n n' acc
+    gon2n (QualTy t _) n acc = gon2n t n acc
+    gon2n (PtrTy t) n acc = gon2n t n acc
+    gon2n _ _ acc = acc
+    n2n = Map.foldrWithKey gon2n Map.empty fullIdx
+
+    update t@(VarTy v) = maybe t (NamedTy) (Map.lookup v n2n)
+    update t@(NamedTy _) = t
+    update t@(EnumTy _) = t
+    update (QualTy t q) = QualTy (update t) q
+    update (PtrTy t) = PtrTy (update t)
+    update (FunTy t tx) = FunTy (update t) (map (\t -> update t) tx)
+    update (RecTy fs n) = RecTy (map (\(Field fn ft) -> Field fn (update ft)) fs) n
+    tcx_''' = Map.map (\(t, b) -> (update t, b)) tcx_''
+    tcxElab_'''' = Map.map (\(t, b) -> (update t, b)) tcxElab_'''
+
+  return (TyCtx $ tcx_''' `Map.union` tcxElab_'''', VarCtx vcx_)
+
+
+-- | Name a composite type by increasing IDs.
+makeName :: TyIdx -> Ty -> SolverM TyIdx
+makeName idx t@(RecTy _ _ ) = do
+  n <- fakeName
+  return $ idx %% (t %-> n)
+makeName _ _ = error "cannot happen, only for composite"
+
+
+-- | Enforce that a struct which is referenced by an elaborated name is accordingly named.
+keepElab :: Name -> Ty -> Ty
+keepElab k t@(RecTy fs n)
+  | isVar n && isElabRec k = RecTy fs k
+  | otherwise = t
+keepElab _ t = t
+
+
+-- | Orphanize unresolved type variables.
+stage6 :: TyCtx -> VarCtx -> (TyCtx, VarCtx)
+stage6 tcx vcx =
+  let
+    pick k t@(VarTy _) acc
+      | isElab k = acc %% (t %-> k)
+      | otherwise = acc
+    pick k (QualTy t _) acc = pick k t acc
+    pick k _ acc = acc
+    elabOrph = Map.foldrWithKey (\k (t, _) acc -> pick k t acc) nullIdx (tyctx tcx)
+
+    dummy n
+      | isElabRec n = RecTy [Field (Name "dummy") Data.BuiltIn.int] n
+      | isElabUnion n = SumTy [Field (Name "dummy") Data.BuiltIn.int] n
+      | otherwise = EnumTy n
+    go k t =
+      case Map.lookup t (ty2n elabOrph) of
+        Just k' -> if k == k' then dummy k else orphanize elabOrph t
+        Nothing -> orphanize elabOrph t
+    tcx_ = Map.mapWithKey (\k (t, b) -> (go k t, b)) (tyctx tcx)
+    vcx_ = Map.map (\(ValSym t b ro st) -> ValSym (orphanize elabOrph t) b ro st) (varctx vcx)
+  in
+    (TyCtx tcx_, VarCtx vcx_)
 
 
 punifyList :: [Constraint] -> SolverM Subst
@@ -423,20 +635,31 @@ dunifyList :: [Constraint] -> SolverM Subst
 dunifyList [] = return nullSubst
 dunifyList ((t :>: t') : ts) = do
     s <- dunify t t' Relax
+    --liftIO (print $ pprint (t :>: t') <+> text "|" <+> pprint s)
     s' <- dunifyList (apply s ts)
     return (s' @@ s)
 
 
-punifyFields :: [Constraint] -> SolverM Subst
-punifyFields = punifyList . eqlist
-  where
-    typeFrom (Field _ t) = t
-    eqlist [] = []
-    eqlist [ (Has _ t) ] = [ ]
-    eqlist (h@(Has _ t@(Field n ty)) : h'@(Has _ t'@(Field n' ty')) : fs) =
-        if n == n'
-            then (((typeFrom t) :=: (typeFrom t')) : eqlist (h':fs))
-            else (eqlist (h':fs))
+sortFields :: [Constraint] -> Subst -> [Constraint]
+sortFields fs s =
+  let
+    fsubs = apply s fs
+    tyAndFieldPred (Has t (Field fn _)) (Has t' (Field fn' _))
+      | tn == tn' = compare fn fn'
+      | otherwise = compare tn tn'
+     where
+      tn = (nameOf t)
+      tn' = (nameOf t') in
+  List.sortBy tyAndFieldPred fsubs
 
-isVar :: Pretty a => a -> Bool
-isVar = (== "#alpha") . take 6 . show . pprint
+
+punifyFields :: [Constraint] -> SolverM Subst
+punifyFields =
+  punifyList . eqlist
+ where
+  typeFrom (Field _ t) = t
+  eqlist [] = []
+  eqlist [ (Has _ t) ] = [ ]
+  eqlist (h@(Has rt t@(Field n ty)) : h'@(Has rt' t'@(Field n' ty')) : fs)
+    | (nameOf rt) == (nameOf rt') && n == n' = (((typeFrom t) :=: (typeFrom t')) : eqlist (h':fs))
+    | otherwise = (eqlist (h':fs))

@@ -1,4 +1,12 @@
-typedef  int /*<<< orphan or scalar*/ Graph ;
-int /*<<< orphan or scalar*/ EDGE (int,int) ;
-int /*<<< orphan or scalar*/ GRAPHinit (int) ;
-int /*<<< orphan or scalar*/ GRAPHinsertE (int /*<<< orphan or scalar*/,int /*<<< orphan or scalar*/) ;
+/* Forward declarations */
+
+/* Type definitions */
+typedef  int /*<<< orphan*/  Graph ;
+
+/* Variables and functions */
+ int /*<<< orphan*/  EDGE (int,int) ; 
+ int /*<<< orphan*/  GRAPHinit (int) ; 
+ int /*<<< orphan*/  GRAPHinsertE (int /*<<< orphan*/ ,int /*<<< orphan*/ ) ; 
+ double RAND_MAX ; 
+ double rand () ; 
+

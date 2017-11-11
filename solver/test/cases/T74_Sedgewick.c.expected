@@ -1,5 +1,15 @@
-typedef  int /*<<< orphan or scalar*/ Complex ;
-int /*<<< orphan or scalar*/ COMPLEXinit (double,double) ;
-int /*<<< orphan or scalar*/ COMPLEXmult (int /*<<< orphan or scalar*/,int /*<<< orphan or scalar*/) ;
-double Im (int /*<<< orphan or scalar*/) ;
-double Re (int /*<<< orphan or scalar*/) ;
+/* Forward declarations */
+
+/* Type definitions */
+typedef  int /*<<< orphan*/  Complex ;
+
+/* Variables and functions */
+ int /*<<< orphan*/  COMPLEXinit (int /*<<< orphan*/ ,int /*<<< orphan*/ ) ; 
+ int /*<<< orphan*/  COMPLEXmult (int /*<<< orphan*/ ,int /*<<< orphan*/ ) ; 
+ double Im (int /*<<< orphan*/ ) ; 
+ double Re (int /*<<< orphan*/ ) ; 
+ int atoi (char*) ; 
+ int /*<<< orphan*/  cos (float) ; 
+ int /*<<< orphan*/  printf (char*,double,...) ; 
+ int /*<<< orphan*/  sin (float) ; 
+

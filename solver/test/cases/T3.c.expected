@@ -1,2 +1,11 @@
-typedef struct __T2__ {int i; struct __T2__ * next;} T2 ;
-typedef struct __T__ {struct __T__ * next;int /*<<< orphan or scalar*/ i; } T ;
+/* Forward declarations */
+typedef  struct TYPE_4__   TYPE_2__ ;
+typedef  struct TYPE_3__   TYPE_1__ ;
+
+/* Type definitions */
+struct TYPE_4__ {struct TYPE_4__* next; scalar_t__ i; } ;
+struct TYPE_3__ {int i; struct TYPE_3__* next; } ;
+typedef  TYPE_1__ T2 ;
+typedef  TYPE_2__ T ;
+
+/* Variables and functions */

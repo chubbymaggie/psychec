@@ -1,4 +1,12 @@
-typedef  int /*<<< orphan or scalar*/ Result ;
-typedef  struct __List__ {double data;struct __List__* next;}* List ;
-typedef  struct __List__* Chain ;
-int /*<<< orphan or scalar*/ analyse (struct __List__*) ; 
+/* Forward declarations */
+typedef  struct TYPE_4__   TYPE_1__ ;
+
+/* Type definitions */
+struct TYPE_4__ {double data; struct TYPE_4__* next; } ;
+typedef  int /*<<< orphan*/  Result ;
+typedef  TYPE_1__* List ;
+typedef  TYPE_1__* Chain ;
+
+/* Variables and functions */
+ int /*<<< orphan*/  analyse (TYPE_1__*) ;
+

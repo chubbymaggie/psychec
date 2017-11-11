@@ -1,2 +1,10 @@
-typedef struct __link__ {int /*<<< orphan or scalar*/ y;}* link ;
-typedef int /*<<< orphan or scalar*/ A ;
+/* Forward declarations */
+typedef  struct TYPE_2__   TYPE_1__ ;
+
+/* Type definitions */
+typedef  TYPE_1__* link ;
+struct TYPE_2__ {int /*<<< orphan*/  y; } ;
+typedef  int /*<<< orphan*/  A ;
+
+/* Variables and functions */
+

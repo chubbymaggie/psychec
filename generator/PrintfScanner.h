@@ -36,6 +36,7 @@ public:
         String,
         Int,
         FloatingPoint,
+        Pointer,
         Unknown
     };
 

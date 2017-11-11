@@ -1,1 +1,7 @@
-typedef int T;
+/* Forward declarations */
+
+/* Type definitions */
+
+/* Variables and functions */
+ int remaining_bytes ; 
+
